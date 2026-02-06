@@ -6,13 +6,11 @@ Build a dataset of:
   [CONTEXT][QUERY][answer]
 where answer is generated from context using Qwen3-4B-Instruct,
 and sometimes CONTEXT is mismatched so answer should be "I don't know".
+Some examples intentionally omit context and use a fixed no-context answer.
 
 Output: Parquet shards with fields:
   - query, context, answer
-  - is_negative (bool)
-  - synth_id, query_seed_url, seed_license
-  - text (chat formatted)
-  - prompt_len (token length to mask so training loss applies only to answer tokens)
+  - negative (bool)
 
 Requirements:
   pip install -U "transformers>=4.51.0" datasets accelerate torch tqdm
@@ -33,6 +31,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from synth_utils import (
     IDK_DEFAULT,
+    NO_CONTEXT_DEFAULT,
     build_messages,
     extract_json_obj,
     load_state,
@@ -45,12 +44,14 @@ from synth_utils import (
 )
 
 IDK = IDK_DEFAULT
+NO_CONTEXT_ANSWER = NO_CONTEXT_DEFAULT
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT_TEMPLATE = (
     "You are a strict question-answering assistant.\n"
     "Rules:\n"
+    "0) If CONTEXT is empty, reply with EXACTLY: {no_context}\n"
     "1) Use ONLY the provided CONTEXT.\n"
-    f"2) If the answer is not explicitly stated in CONTEXT, reply with EXACTLY: {IDK}\n"
+    "2) If the answer is not explicitly stated in CONTEXT, reply with EXACTLY: {idk}\n"
     "3) Do not use outside knowledge. Do not guess.\n"
     "4) Reply with only the final answer text. No preamble.\n"
 )
@@ -58,13 +59,14 @@ SYSTEM_PROMPT = (
 # Optional JSON mode for higher-quality filtering:
 # This makes it easier to sanity-check that the model extracted an explicit quote.
 USE_JSON_MODE_DEFAULT = True
-SYSTEM_PROMPT_JSON = (
+SYSTEM_PROMPT_JSON_TEMPLATE = (
     "You are a dataset generator.\n"
     "You must answer the QUESTION using ONLY the provided CONTEXT.\n"
-    f"If the answer is not explicitly stated in CONTEXT, set answer to EXACTLY: {IDK}\n"
+    "If CONTEXT is empty, set answer to EXACTLY: {no_context}\n"
+    "If the answer is not explicitly stated in CONTEXT, set answer to EXACTLY: {idk}\n"
     "Return STRICT JSON and nothing else with keys:\n"
-    '  {"answer": "...", "quotes": ["verbatim quote 1", "verbatim quote 2"]}\n'
-    f'If answer is "{IDK}", quotes must be [].\n'
+    '  {{"answer": "...", "quotes": ["verbatim quote 1", "verbatim quote 2"]}}\n'
+    'If answer is "{idk}" or "{no_context}", quotes must be [].\n'
 )
 
 
@@ -140,6 +142,9 @@ def main() -> None:
     ap.add_argument("--neg_ratio", type=float, default=0.30, help="Probability to create a negative (mismatched context) example per row")
     ap.add_argument("--neg_pool_size", type=int, default=4096, help="Size of pool for sampling mismatched contexts")
     ap.add_argument("--neg_pool_warmup", type=int, default=256, help="Need this many contexts before sampling negatives")
+    ap.add_argument("--missing_context_ratio", type=float, default=0.005, help="Probability to add missing-context examples")
+    ap.add_argument("--missing_context_max", type=int, default=1000, help="Maximum missing-context examples to add")
+    ap.add_argument("--missing_context_answer", type=str, default=NO_CONTEXT_ANSWER, help="Answer when context is missing")
     ap.add_argument("--shard_size", type=int, default=50_000, help="Examples per Parquet shard")
     ap.add_argument("--parquet_compression", type=str, default="zstd", help="Parquet compression codec (zstd|snappy|gzip|none)")
 
@@ -198,8 +203,18 @@ def main() -> None:
     resume_rows = int(state.get("rows_seen", 0))
     rows_seen = resume_rows if args.resume else 0
     written = int(state.get("written", 0)) if args.resume else 0
+    missing_context_written = int(state.get("missing_context_written", 0)) if args.resume else 0
     if args.resume:
         restore_random_state(state, args.seed)
+
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        idk=IDK,
+        no_context=args.missing_context_answer,
+    )
+    system_prompt_json = SYSTEM_PROMPT_JSON_TEMPLATE.format(
+        idk=IDK,
+        no_context=args.missing_context_answer,
+    )
 
     # Load model/tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
@@ -291,7 +306,7 @@ def main() -> None:
             out_buffer = []
 
     def flush_pending() -> None:
-        nonlocal pending, produced
+        nonlocal pending, produced, missing_context_written
         if not pending:
             return
 
@@ -333,7 +348,7 @@ def main() -> None:
                     if not isinstance(quotes, list):
                         quotes = []
 
-                    if answer != IDK:
+                    if answer not in (IDK, args.missing_context_answer):
                         # Filtering: require at least one quote that appears verbatim in context
                         if len(quotes) == 0:
                             continue
@@ -360,44 +375,11 @@ def main() -> None:
             if answer.lower() == "i dont know":
                 answer = IDK
 
-            # Build chat-formatted training text and prompt_len
-            messages_prompt, messages_full = build_messages(
-                query=ex["query"],
-                context=ex["context"],
-                answer=answer,
-                json_mode=False,  # IMPORTANT: training data should be plain answer behavior
-                system_prompt=SYSTEM_PROMPT,
-                system_prompt_json=SYSTEM_PROMPT_JSON,
-                idk_text=IDK,
-            )
-
-            # prompt_len includes the assistant header (generation prompt)
-            prompt_ids = tokenizer.apply_chat_template(
-                messages_prompt,
-                tokenize=True,
-                add_generation_prompt=True,
-            )
-            prompt_len = len(prompt_ids)
-
-            full_text = tokenizer.apply_chat_template(
-                messages_full,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-
             out = {
-                "synth_id": ex["synth_id"],
-                "query_seed_url": ex["query_seed_url"],
-                "seed_license": ex["seed_license"],
-                "is_negative": ex["is_negative"],
+                "negative": ex["is_negative"],
                 "query": ex["query"],
                 "context": ex["context"],
                 "answer": answer,
-                # helpful debugging
-                "quotes": quotes if args.use_json_mode else [],
-                # for SFT
-                "text": full_text,
-                "prompt_len": prompt_len,
             }
 
             out_buffer.append(out)
@@ -405,7 +387,13 @@ def main() -> None:
 
         pending = []
         flush_shards(force=False)
-        save_state(args.state_path, rows_seen=rows_seen, written=written, neg_pool=neg_pool)
+        save_state(
+            args.state_path,
+            rows_seen=rows_seen,
+            written=written,
+            neg_pool=neg_pool,
+            extra={"missing_context_written": missing_context_written},
+        )
 
     pbar = tqdm(
         total=args.max_samples,
@@ -440,13 +428,37 @@ def main() -> None:
 
         # Always keep a positive candidate (may still become IDK if not answerable)
         # We'll run inference for positives.
+        # Optionally add missing-context example
+        if (
+            args.missing_context_ratio > 0.0
+            and missing_context_written < args.missing_context_max
+            and random.random() < args.missing_context_ratio
+        ):
+            pending.append(
+                {
+                    "synth_id": synth_id,
+                    "query_seed_url": url,
+                    "seed_license": seed_license,
+                    "query": query,
+                    "context": "",
+                    "is_negative": True,
+                    "is_missing_context": True,
+                    "needs_infer": False,
+                    "force_idk": False,
+                    "prompt_text": "",
+                    "answer": args.missing_context_answer,
+                    "quotes": [],
+                }
+            )
+            missing_context_written += 1
+
         msg_prompt, _ = build_messages(
             query=query,
             context=context,
             answer=None,
             json_mode=args.use_json_mode,
-            system_prompt=SYSTEM_PROMPT,
-            system_prompt_json=SYSTEM_PROMPT_JSON,
+            system_prompt=system_prompt,
+            system_prompt_json=system_prompt_json,
             idk_text=IDK,
         )
         prompt_text = tokenizer.apply_chat_template(
@@ -513,7 +525,13 @@ def main() -> None:
     pbar.n = produced
     pbar.refresh()
     pbar.close()
-    save_state(args.state_path, rows_seen=rows_seen, written=written, neg_pool=neg_pool)
+    save_state(
+        args.state_path,
+        rows_seen=rows_seen,
+        written=written,
+        neg_pool=neg_pool,
+        extra={"missing_context_written": missing_context_written},
+    )
 
     print(f"Done. Wrote {written} examples to {out_dir}")
 
