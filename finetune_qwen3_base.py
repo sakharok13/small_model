@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--prompt_template",
         type=str,
-        default="[query_start]{query}[query_end][context_start]{context}[context_end][answer_start]",
+        default="[context_start]{context}[context_end][query_start]{query}[query_end][answer_start]",
         help="Template for prompt (no answer).",
     )
     ap.add_argument(

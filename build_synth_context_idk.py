@@ -3,11 +3,11 @@
 
 """
 Build a dataset of:
-  [query][CONTEXT][answer]
+  [CONTEXT][QUERY][answer]
 where answer is generated from context using Qwen3-4B-Instruct,
 and sometimes CONTEXT is mismatched so answer should be "I don't know".
 
-Output: JSONL with fields:
+Output: Parquet shards with fields:
   - query, context, answer
   - is_negative (bool)
   - synth_id, query_seed_url, seed_license
@@ -20,11 +20,8 @@ Qwen3 recommends transformers>=4.51.0.
 """
 
 import argparse
-import ast
-import json
 import os
 import random
-import re
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -34,7 +31,20 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-IDK = "I can't find the answer in the context"
+from synth_utils import (
+    IDK_DEFAULT,
+    build_messages,
+    extract_json_obj,
+    load_state,
+    next_shard_idx,
+    restore_random_state,
+    save_state,
+    truncate_text,
+    valid_row,
+    with_rank_suffix_dir,
+)
+
+IDK = IDK_DEFAULT
 
 SYSTEM_PROMPT = (
     "You are a strict question-answering assistant.\n"
@@ -58,127 +68,7 @@ SYSTEM_PROMPT_JSON = (
 )
 
 
-def valid_row(
-    row: Dict[str, Any],
-    lang: str,
-    min_context_chars: int,
-    max_context_chars: int,
-    max_query_chars: int,
-) -> bool:
-    """Filter SYNTH rows to ones suitable for context-grounded QA."""
-    if row.get("language") != lang:
-        return False
-    q = (row.get("query") or "").strip()
-    ctx = (row.get("query_seed_text") or "").strip()
-
-    if not q or not ctx:
-        return False
-
-    if len(q) > max_query_chars:
-        return False
-
-    if len(ctx) < min_context_chars:
-        return False
-
-    # We'll truncate later if too long
-    if len(ctx) > max_context_chars * 10:
-        # Extremely long contexts are often noisy; drop them early
-        return False
-
-    return True
-
-
-def truncate_text(s: str, max_chars: int) -> str:
-    s = s.strip()
-    if len(s) <= max_chars:
-        return s
-    # Keep head; context usually has the needed answer near the beginning in SYNTH seeds
-    return s[:max_chars].rstrip()
-
-
-def build_user_content(query: str, context: str, json_mode: bool) -> str:
-    if json_mode:
-        return (
-            "QUESTION:\n"
-            f"{query}\n\n"
-            "CONTEXT:\n"
-            f"{context}\n\n"
-            "Return JSON."
-        )
-    return (
-        "QUESTION:\n"
-        f"{query}\n\n"
-        "CONTEXT:\n"
-        f"{context}\n\n"
-        f"Answer using only CONTEXT. If not in context, reply exactly: {IDK}"
-    )
-
-
-def build_messages(
-    query: str,
-    context: str,
-    answer: Optional[str],
-    json_mode: bool,
-) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
-    """
-    Returns:
-      - messages_prompt: system + user (no assistant answer)   [for inference prompt & prompt_len]
-      - messages_full:   system + user + assistant(answer)     [for training text]
-    """
-    system = SYSTEM_PROMPT_JSON if json_mode else SYSTEM_PROMPT
-    messages_prompt = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": build_user_content(query, context, json_mode=json_mode)},
-    ]
-    messages_full = messages_prompt + ([{"role": "assistant", "content": answer}] if answer is not None else [])
-    return messages_prompt, messages_full
-
-
-def extract_json_obj(s: str) -> Optional[Dict[str, Any]]:
-    """
-    Extracts the first {...} JSON object from model output.
-    Qwen may occasionally wrap; we keep it robust.
-    """
-    # Greedy match; output should be short
-    m = re.search(r"\{.*\}", s, re.DOTALL)
-    if not m:
-        return None
-    blob = m.group(0)
-    try:
-        return json.loads(blob)
-    except Exception:
-        return None
-
-
-def load_state(path: str) -> Dict[str, Any]:
-    if not path or not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as fh:
-        try:
-            return json.load(fh)
-        except Exception:
-            return {}
-
-
-def save_state(path: str, rows_seen: int, written: int, neg_pool: Deque[Tuple[str, str]]) -> None:
-    if not path:
-        return
-    state = {
-        "rows_seen": rows_seen,
-        "written": written,
-        "random_state": repr(random.getstate()),
-        "neg_pool": list(neg_pool),
-    }
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, ensure_ascii=False)
-    os.replace(tmp, path)
-
-
-def with_rank_suffix(path: str, rank: int) -> str:
-    if path.endswith(".jsonl"):
-        return f"{path[:-6]}.rank{rank}.jsonl"
-    return f"{path}.rank{rank}"
+ 
 
 
 @torch.inference_mode()
@@ -243,13 +133,15 @@ def main() -> None:
     ap.add_argument("--split", type=str, default="train")
     ap.add_argument("--lang", type=str, default="en")
     ap.add_argument("--model_name", type=str, default="Qwen/Qwen3-14B")
-    ap.add_argument("--out_jsonl", type=str, required=True)
+    ap.add_argument("--out_dir", type=str, required=True, help="Output directory for Parquet shards")
     ap.add_argument("--trust_remote_code", action="store_true", help="Enable trust_remote_code for model loading")
 
     ap.add_argument("--max_samples", type=int, default=50_000, help="Max output examples (per-rank when distributed)")
     ap.add_argument("--neg_ratio", type=float, default=0.30, help="Probability to create a negative (mismatched context) example per row")
     ap.add_argument("--neg_pool_size", type=int, default=4096, help="Size of pool for sampling mismatched contexts")
     ap.add_argument("--neg_pool_warmup", type=int, default=256, help="Need this many contexts before sampling negatives")
+    ap.add_argument("--shard_size", type=int, default=50_000, help="Examples per Parquet shard")
+    ap.add_argument("--parquet_compression", type=str, default="zstd", help="Parquet compression codec (zstd|snappy|gzip|none)")
 
     ap.add_argument("--min_context_chars", type=int, default=300)
     ap.add_argument("--max_context_chars", type=int, default=6000)
@@ -265,19 +157,21 @@ def main() -> None:
     ap.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.90, help="vLLM GPU memory utilization fraction")
     ap.add_argument("--vllm_max_model_len", type=int, default=8192, help="vLLM max model length")
     ap.add_argument("--vllm_dtype", type=str, default="auto", help="vLLM dtype: auto|float16|bfloat16|float32")
-    ap.add_argument("--state_path", type=str, default="", help="Path to resume state (default: out_jsonl + .state.json)")
-    ap.add_argument("--resume", action="store_true", help="Resume from state file and append to out_jsonl")
+    ap.add_argument("--state_path", type=str, default="", help="Path to resume state (default: out_dir/state.json)")
+    ap.add_argument("--resume", action="store_true", help="Resume from state file and append shards to out_dir")
     ap.add_argument(
         "--distributed_output_mode",
         type=str,
         choices=["per_rank", "single"],
         default="per_rank",
-        help="In multi-GPU, write per-rank output files (recommended) or a single shared file (unsafe).",
+        help="In multi-GPU, write per-rank output dirs (recommended) or a single shared dir (unsafe).",
     )
 
     args = ap.parse_args()
     if args.no_json_mode:
         args.use_json_mode = False
+    if args.shard_size <= 0:
+        raise ValueError("--shard_size must be > 0")
 
     from accelerate import Accelerator
 
@@ -293,23 +187,19 @@ def main() -> None:
 
     random.seed(args.seed)
 
-    out_jsonl = args.out_jsonl
+    out_dir = args.out_dir
     if world > 1 and args.distributed_output_mode == "per_rank":
-        out_jsonl = with_rank_suffix(args.out_jsonl, rank)
-    os.makedirs(os.path.dirname(out_jsonl) or ".", exist_ok=True)
+        out_dir = with_rank_suffix_dir(args.out_dir, rank)
+    os.makedirs(out_dir, exist_ok=True)
     if not args.state_path:
-        args.state_path = f"{out_jsonl}.state.json"
+        args.state_path = os.path.join(out_dir, "state.json")
 
     state = load_state(args.state_path) if args.resume else {}
     resume_rows = int(state.get("rows_seen", 0))
     rows_seen = resume_rows if args.resume else 0
     written = int(state.get("written", 0)) if args.resume else 0
-    if args.resume and state.get("random_state"):
-        try:
-            random.setstate(ast.literal_eval(state["random_state"]))
-        except Exception:
-            # fall back to seed if state is corrupted
-            random.seed(args.seed)
+    if args.resume:
+        restore_random_state(state, args.seed)
 
     # Load model/tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
@@ -366,9 +256,42 @@ def main() -> None:
 
     # We'll accumulate inference jobs and flush in batches
     pending: List[Dict[str, Any]] = []
+    out_buffer: List[Dict[str, Any]] = []
+    produced = written
+    shard_idx = next_shard_idx(out_dir)
 
-    def flush_pending(fh) -> None:
-        nonlocal pending, written
+    def write_shard(rows: List[Dict[str, Any]]) -> None:
+        nonlocal written, shard_idx
+        if not rows:
+            return
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("pyarrow is required for Parquet output. Install pyarrow.") from exc
+
+        compression = args.parquet_compression
+        if compression == "none":
+            compression = None
+
+        table = pa.Table.from_pylist(rows)
+        path = os.path.join(out_dir, f"part-{shard_idx:05d}.parquet")
+        pq.write_table(table, path, compression=compression)
+        shard_idx += 1
+        written += len(rows)
+
+    def flush_shards(force: bool) -> None:
+        nonlocal out_buffer
+        while len(out_buffer) >= args.shard_size:
+            chunk = out_buffer[: args.shard_size]
+            out_buffer = out_buffer[args.shard_size :]
+            write_shard(chunk)
+        if force and out_buffer:
+            write_shard(out_buffer)
+            out_buffer = []
+
+    def flush_pending() -> None:
+        nonlocal pending, produced
         if not pending:
             return
 
@@ -443,6 +366,9 @@ def main() -> None:
                 context=ex["context"],
                 answer=answer,
                 json_mode=False,  # IMPORTANT: training data should be plain answer behavior
+                system_prompt=SYSTEM_PROMPT,
+                system_prompt_json=SYSTEM_PROMPT_JSON,
+                idk_text=IDK,
             )
 
             # prompt_len includes the assistant header (generation prompt)
@@ -474,115 +400,122 @@ def main() -> None:
                 "prompt_len": prompt_len,
             }
 
-            fh.write(json.dumps(out, ensure_ascii=False) + "\n")
-            written += 1
+            out_buffer.append(out)
+            produced += 1
 
         pending = []
+        flush_shards(force=False)
         save_state(args.state_path, rows_seen=rows_seen, written=written, neg_pool=neg_pool)
 
-    out_mode = "a" if args.resume else "w"
-    with open(out_jsonl, out_mode, encoding="utf-8") as fh:
-        pbar = tqdm(
-            total=args.max_samples,
-            desc=f"writing examples (rank {rank})",
-            unit="ex",
-            initial=written,
-            disable=not accelerator.is_local_main_process,
+    pbar = tqdm(
+        total=args.max_samples,
+        desc=f"writing examples (rank {rank})",
+        unit="ex",
+        initial=produced,
+        disable=not accelerator.is_local_main_process,
+    )
+
+    for row in ds:
+        if produced >= args.max_samples:
+            break
+        rows_seen += 1
+        if skip_remaining > 0:
+            skip_remaining -= 1
+            continue
+
+        if not valid_row(
+            row=row,
+            lang=args.lang,
+            min_context_chars=args.min_context_chars,
+            max_context_chars=args.max_context_chars,
+            max_query_chars=args.max_query_chars,
+        ):
+            continue
+
+        query = row["query"].strip()
+        context = truncate_text(row["query_seed_text"], args.max_context_chars)
+        url = row.get("query_seed_url") or ""
+        seed_license = row.get("seed_license") or ""
+        synth_id = row.get("synth_id") or ""
+
+        # Always keep a positive candidate (may still become IDK if not answerable)
+        # We'll run inference for positives.
+        msg_prompt, _ = build_messages(
+            query=query,
+            context=context,
+            answer=None,
+            json_mode=args.use_json_mode,
+            system_prompt=SYSTEM_PROMPT,
+            system_prompt_json=SYSTEM_PROMPT_JSON,
+            idk_text=IDK,
+        )
+        prompt_text = tokenizer.apply_chat_template(
+            msg_prompt,
+            tokenize=False,
+            add_generation_prompt=True,
         )
 
-        for row in ds:
-            if written >= args.max_samples:
-                break
-            rows_seen += 1
-            if skip_remaining > 0:
-                skip_remaining -= 1
-                continue
+        pending.append(
+            {
+                "synth_id": synth_id,
+                "query_seed_url": url,
+                "seed_license": seed_license,
+                "query": query,
+                "context": context,
+                "is_negative": False,
+                "needs_infer": True,
+                "force_idk": False,
+                "prompt_text": prompt_text,
+                "answer": "",
+            }
+        )
 
-            if not valid_row(
-                row=row,
-                lang=args.lang,
-                min_context_chars=args.min_context_chars,
-                max_context_chars=args.max_context_chars,
-                max_query_chars=args.max_query_chars,
-            ):
-                continue
+        # Sometimes add a negative (mismatched context)
+        if len(neg_pool) >= args.neg_pool_warmup and random.random() < args.neg_ratio:
+            # sample a context from pool with a different URL when possible
+            ctx_neg, url_neg = random.choice(list(neg_pool))
+            tries = 0
+            while tries < 10 and url_neg == url:
+                ctx_neg, url_neg = random.choice(list(neg_pool))
+                tries += 1
 
-            query = row["query"].strip()
-            context = truncate_text(row["query_seed_text"], args.max_context_chars)
-            url = row.get("query_seed_url") or ""
-            seed_license = row.get("seed_license") or ""
-            synth_id = row.get("synth_id") or ""
+            ctx_neg = truncate_text(ctx_neg, args.max_context_chars)
 
-            # Always keep a positive candidate (may still become IDK if not answerable)
-            # We'll run inference for positives.
-            msg_prompt, _ = build_messages(query=query, context=context, answer=None, json_mode=args.use_json_mode)
-            prompt_text = tokenizer.apply_chat_template(
-                msg_prompt,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-
+            # For negatives, we generally *don't need* model inference; we force IDK
             pending.append(
                 {
                     "synth_id": synth_id,
                     "query_seed_url": url,
                     "seed_license": seed_license,
                     "query": query,
-                    "context": context,
-                    "is_negative": False,
-                    "needs_infer": True,
-                    "force_idk": False,
-                    "prompt_text": prompt_text,
-                    "answer": "",
+                    "context": ctx_neg,
+                    "is_negative": True,
+                    "needs_infer": False,  # change to True if you want model to generate IDK (slower, noisier)
+                    "force_idk": True,
+                    "prompt_text": "",
+                    "answer": IDK,
+                    "quotes": [],
                 }
             )
 
-            # Sometimes add a negative (mismatched context)
-            if len(neg_pool) >= args.neg_pool_warmup and random.random() < args.neg_ratio:
-                # sample a context from pool with a different URL when possible
-                ctx_neg, url_neg = random.choice(list(neg_pool))
-                tries = 0
-                while tries < 10 and url_neg == url:
-                    ctx_neg, url_neg = random.choice(list(neg_pool))
-                    tries += 1
+        # Update negative pool
+        neg_pool.append((context, url))
 
-                ctx_neg = truncate_text(ctx_neg, args.max_context_chars)
+        # Flush batches
+        if len(pending) >= args.batch_size:
+            flush_pending()
+            pbar.n = produced
+            pbar.refresh()
 
-                # For negatives, we generally *don't need* model inference; we force IDK
-                pending.append(
-                    {
-                        "synth_id": synth_id,
-                        "query_seed_url": url,
-                        "seed_license": seed_license,
-                        "query": query,
-                        "context": ctx_neg,
-                        "is_negative": True,
-                        "needs_infer": False,  # change to True if you want model to generate IDK (slower, noisier)
-                        "force_idk": True,
-                        "prompt_text": "",
-                        "answer": IDK,
-                        "quotes": [],
-                    }
-                )
+    # final flush
+    flush_pending()
+    flush_shards(force=True)
+    pbar.n = produced
+    pbar.refresh()
+    pbar.close()
+    save_state(args.state_path, rows_seen=rows_seen, written=written, neg_pool=neg_pool)
 
-            # Update negative pool
-            neg_pool.append((context, url))
-
-            # Flush batches
-            if len(pending) >= args.batch_size:
-                flush_pending(fh)
-                # update pbar by delta written in flush? easiest: set to written
-                pbar.n = written
-                pbar.refresh()
-
-        # final flush
-        flush_pending(fh)
-        pbar.n = written
-        pbar.refresh()
-        pbar.close()
-        save_state(args.state_path, rows_seen=rows_seen, written=written, neg_pool=neg_pool)
-
-    print(f"Done. Wrote {written} examples to {out_jsonl}")
+    print(f"Done. Wrote {written} examples to {out_dir}")
 
 
 if __name__ == "__main__":
