@@ -7,6 +7,7 @@ from glob import glob
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 IDK_DEFAULT = "I can't find the answer in the context"
+NO_CONTEXT_DEFAULT = "i dont see any relevant context."
 
 
 def valid_row(
@@ -124,7 +125,13 @@ def restore_random_state(state: Dict[str, Any], seed: int) -> None:
         random.seed(seed)
 
 
-def save_state(path: str, rows_seen: int, written: int, neg_pool: Deque[Tuple[str, str]]) -> None:
+def save_state(
+    path: str,
+    rows_seen: int,
+    written: int,
+    neg_pool: Deque[Tuple[str, str]],
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
     if not path:
         return
     state = {
@@ -133,6 +140,8 @@ def save_state(path: str, rows_seen: int, written: int, neg_pool: Deque[Tuple[st
         "random_state": repr(random.getstate()),
         "neg_pool": list(neg_pool),
     }
+    if extra:
+        state.update(extra)
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(state, fh, ensure_ascii=False)
