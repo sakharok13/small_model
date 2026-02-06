@@ -4,7 +4,7 @@
 """
 Build a dataset of:
   [CONTEXT][QUERY][answer]
-where answer is generated from context using Qwen3-4B-Instruct,
+where answer is generated from context using Qwen3-14B,
 and sometimes CONTEXT is mismatched so answer should be "I don't know".
 Some examples intentionally omit context and use a fixed no-context answer.
 
@@ -15,6 +15,11 @@ Output: Parquet shards with fields:
 Requirements:
   pip install -U "transformers>=4.51.0" datasets accelerate torch tqdm
 Qwen3 recommends transformers>=4.51.0.
+
+Qwen3 Best-Practice sampling (from official model card):
+  Thinking mode:     temperature=0.6, top_p=0.95, top_k=20, min_p=0
+  Non-thinking mode: temperature=0.7, top_p=0.8,  top_k=20, min_p=0
+  DO NOT use greedy decoding — it causes degradation and endless repetitions.
 """
 
 import argparse
@@ -79,8 +84,11 @@ def generate_batch_hf(
     tokenizer,
     prompt_texts: List[str],
     max_new_tokens: int,
+    temperature: float = 0.7,
+    top_p: float = 0.8,
+    top_k: int = 20,
 ) -> List[str]:
-    """Greedy generate a batch of completions using HF Transformers."""
+    """Generate a batch of completions using HF Transformers with Qwen3 recommended sampling."""
     enc = tokenizer(
         prompt_texts,
         return_tensors="pt",
@@ -96,7 +104,10 @@ def generate_batch_hf(
     out = model.generate(
         **enc,
         max_new_tokens=max_new_tokens,
-        do_sample=False,
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
@@ -110,13 +121,17 @@ def generate_batch_vllm(
     llm,
     prompt_texts: List[str],
     max_new_tokens: int,
+    temperature: float = 0.7,
+    top_p: float = 0.8,
+    top_k: int = 20,
 ) -> List[str]:
-    """Greedy generate a batch of completions using vLLM."""
+    """Generate a batch of completions using vLLM with Qwen3 recommended sampling."""
     from vllm import SamplingParams
 
     sampling = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
         max_tokens=max_new_tokens,
     )
     outputs = llm.generate(prompt_texts, sampling_params=sampling)
@@ -163,6 +178,18 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--use_json_mode", action="store_true", default=USE_JSON_MODE_DEFAULT, help="Ask Qwen for JSON with quotes and filter by quotes")
     ap.add_argument("--no_json_mode", action="store_true", help="Disable JSON mode")
+
+    # Qwen3 sampling hyper-parameters (official best-practice defaults).
+    # Thinking mode:     temperature=0.6, top_p=0.95, top_k=20
+    # Non-thinking mode: temperature=0.7, top_p=0.8,  top_k=20
+    ap.add_argument("--enable_thinking", action="store_true", default=False,
+                    help="Enable Qwen3 thinking mode (<think> blocks). Default: off (non-thinking).")
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="Sampling temperature (default: auto from thinking mode; 0.6 thinking / 0.7 non-thinking)")
+    ap.add_argument("--top_p", type=float, default=None,
+                    help="Top-p nucleus sampling (default: auto; 0.95 thinking / 0.8 non-thinking)")
+    ap.add_argument("--top_k", type=int, default=None,
+                    help="Top-k sampling (default: 20)")
     ap.add_argument("--use_vllm", action="store_true", help="Use vLLM for fast multi-GPU inference")
     ap.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="vLLM tensor parallel size (e.g. 4 or 8)")
     ap.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.90, help="vLLM GPU memory utilization fraction")
@@ -183,6 +210,20 @@ def main() -> None:
         args.use_json_mode = False
     if args.shard_size <= 0:
         raise ValueError("--shard_size must be > 0")
+
+    # Apply Qwen3 official sampling defaults based on thinking mode
+    if args.enable_thinking:
+        if args.temperature is None:
+            args.temperature = 0.6
+        if args.top_p is None:
+            args.top_p = 0.95
+    else:
+        if args.temperature is None:
+            args.temperature = 0.7
+        if args.top_p is None:
+            args.top_p = 0.8
+    if args.top_k is None:
+        args.top_k = 20
 
     from accelerate import Accelerator
 
@@ -301,6 +342,9 @@ def main() -> None:
                     llm=llm,
                     prompt_texts=prompt_texts,
                     max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k,
                 )
             else:
                 completions = generate_batch_hf(
@@ -308,6 +352,9 @@ def main() -> None:
                     tokenizer=tokenizer,
                     prompt_texts=prompt_texts,
                     max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k,
                 )
 
         # Assign outputs back
@@ -451,6 +498,7 @@ def main() -> None:
                 msg_prompt,
                 tokenize=False,
                 add_generation_prompt=True,
+                enable_thinking=args.enable_thinking,
             )
 
             pending.append(
