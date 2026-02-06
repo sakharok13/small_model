@@ -175,6 +175,12 @@ def save_state(path: str, rows_seen: int, written: int, neg_pool: Deque[Tuple[st
     os.replace(tmp, path)
 
 
+def with_rank_suffix(path: str, rank: int) -> str:
+    if path.endswith(".jsonl"):
+        return f"{path[:-6]}.rank{rank}.jsonl"
+    return f"{path}.rank{rank}"
+
+
 @torch.inference_mode()
 def generate_batch_hf(
     model,
@@ -240,7 +246,7 @@ def main() -> None:
     ap.add_argument("--out_jsonl", type=str, required=True)
     ap.add_argument("--trust_remote_code", action="store_true", help="Enable trust_remote_code for model loading")
 
-    ap.add_argument("--max_samples", type=int, default=50_000, help="Max output examples (after filtering)")
+    ap.add_argument("--max_samples", type=int, default=50_000, help="Max output examples (per-rank when distributed)")
     ap.add_argument("--neg_ratio", type=float, default=0.30, help="Probability to create a negative (mismatched context) example per row")
     ap.add_argument("--neg_pool_size", type=int, default=4096, help="Size of pool for sampling mismatched contexts")
     ap.add_argument("--neg_pool_warmup", type=int, default=256, help="Need this many contexts before sampling negatives")
@@ -261,16 +267,38 @@ def main() -> None:
     ap.add_argument("--vllm_dtype", type=str, default="auto", help="vLLM dtype: auto|float16|bfloat16|float32")
     ap.add_argument("--state_path", type=str, default="", help="Path to resume state (default: out_jsonl + .state.json)")
     ap.add_argument("--resume", action="store_true", help="Resume from state file and append to out_jsonl")
+    ap.add_argument(
+        "--distributed_output_mode",
+        type=str,
+        choices=["per_rank", "single"],
+        default="per_rank",
+        help="In multi-GPU, write per-rank output files (recommended) or a single shared file (unsafe).",
+    )
 
     args = ap.parse_args()
     if args.no_json_mode:
         args.use_json_mode = False
 
+    from accelerate import Accelerator
+
+    accelerator = Accelerator()
+    world = accelerator.num_processes
+    rank = accelerator.process_index
+
+    if args.use_vllm and world > 1:
+        raise RuntimeError(
+            "vLLM already handles multi-GPU via --vllm_tensor_parallel_size. "
+            "Run with a single process (no accelerate) when using vLLM."
+        )
+
     random.seed(args.seed)
 
-    os.makedirs(os.path.dirname(args.out_jsonl) or ".", exist_ok=True)
+    out_jsonl = args.out_jsonl
+    if world > 1 and args.distributed_output_mode == "per_rank":
+        out_jsonl = with_rank_suffix(args.out_jsonl, rank)
+    os.makedirs(os.path.dirname(out_jsonl) or ".", exist_ok=True)
     if not args.state_path:
-        args.state_path = f"{args.out_jsonl}.state.json"
+        args.state_path = f"{out_jsonl}.state.json"
 
     state = load_state(args.state_path) if args.resume else {}
     resume_rows = int(state.get("rows_seen", 0))
@@ -306,13 +334,17 @@ def main() -> None:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name,
             torch_dtype="auto",
-            device_map="auto",
+            device_map=None if world > 1 else "auto",
             trust_remote_code=args.trust_remote_code,
         )
+        if world > 1:
+            model.to(accelerator.device)
         model.eval()
 
     # Stream SYNTH (it's massive)
     ds = load_dataset(args.dataset, split=args.split, streaming=True)
+    if world > 1:
+        ds = ds.shard(num_shards=world, index=rank)
     skip_remaining = 0
     if args.resume and resume_rows > 0:
         try:
@@ -449,8 +481,14 @@ def main() -> None:
         save_state(args.state_path, rows_seen=rows_seen, written=written, neg_pool=neg_pool)
 
     out_mode = "a" if args.resume else "w"
-    with open(args.out_jsonl, out_mode, encoding="utf-8") as fh:
-        pbar = tqdm(total=args.max_samples, desc="writing examples", unit="ex", initial=written)
+    with open(out_jsonl, out_mode, encoding="utf-8") as fh:
+        pbar = tqdm(
+            total=args.max_samples,
+            desc=f"writing examples (rank {rank})",
+            unit="ex",
+            initial=written,
+            disable=not accelerator.is_local_main_process,
+        )
 
         for row in ds:
             if written >= args.max_samples:
@@ -544,7 +582,7 @@ def main() -> None:
         pbar.close()
         save_state(args.state_path, rows_seen=rows_seen, written=written, neg_pool=neg_pool)
 
-    print(f"Done. Wrote {written} examples to {args.out_jsonl}")
+    print(f"Done. Wrote {written} examples to {out_jsonl}")
 
 
 if __name__ == "__main__":
