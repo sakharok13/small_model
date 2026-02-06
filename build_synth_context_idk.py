@@ -242,7 +242,7 @@ def main() -> None:
     ap.add_argument("--dataset", type=str, default="PleIAs/SYNTH", help="HF dataset name")
     ap.add_argument("--split", type=str, default="train")
     ap.add_argument("--lang", type=str, default="en")
-    ap.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
+    ap.add_argument("--model_name", type=str, default="Qwen/Qwen3-14B")
     ap.add_argument("--out_jsonl", type=str, required=True)
     ap.add_argument("--trust_remote_code", action="store_true", help="Enable trust_remote_code for model loading")
 
