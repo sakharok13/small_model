@@ -35,7 +35,7 @@ from synth_utils import (
     build_messages,
     extract_json_obj,
     load_state,
-    next_shard_idx,
+    ParquetShardWriter,
     restore_random_state,
     save_state,
     truncate_text,
@@ -146,7 +146,12 @@ def main() -> None:
     ap.add_argument("--missing_context_max", type=int, default=1000, help="Maximum missing-context examples to add")
     ap.add_argument("--missing_context_answer", type=str, default=NO_CONTEXT_ANSWER, help="Answer when context is missing")
     ap.add_argument("--shard_size", type=int, default=50_000, help="Examples per Parquet shard")
-    ap.add_argument("--save_every", type=int, default=5000, help="Force a shard flush every N examples (0 to disable)")
+    ap.add_argument(
+        "--save_every",
+        type=int,
+        default=5000,
+        help="Write buffered rows to the current shard every N examples (0 to only flush at shard_size/end)",
+    )
     ap.add_argument("--parquet_compression", type=str, default="zstd", help="Parquet compression codec (zstd|snappy|gzip|none)")
 
     ap.add_argument("--min_context_chars", type=int, default=300)
@@ -274,53 +279,12 @@ def main() -> None:
     pending: List[Dict[str, Any]] = []
     out_buffer: List[Dict[str, Any]] = []
     produced = written
-    shard_idx = next_shard_idx(out_dir)
-    last_forced_flush = produced
-
-    def write_shard(rows: List[Dict[str, Any]]) -> None:
-        nonlocal written, shard_idx
-        if not rows:
-            return
-        try:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-        except Exception as exc:  # pragma: no cover
-            raise RuntimeError("pyarrow is required for Parquet output. Install pyarrow.") from exc
-
-        compression = args.parquet_compression
-        if compression == "none":
-            compression = None
-
-        table = pa.Table.from_pylist(rows)
-        path = os.path.join(out_dir, f"part-{shard_idx:05d}.parquet")
-        pq.write_table(table, path, compression=compression)
-        shard_idx += 1
-        written += len(rows)
-
-    def flush_shards(force: bool) -> None:
-        nonlocal out_buffer
-        while len(out_buffer) >= args.shard_size:
-            chunk = out_buffer[: args.shard_size]
-            out_buffer = out_buffer[args.shard_size :]
-            write_shard(chunk)
-        if force and out_buffer:
-            write_shard(out_buffer)
-            out_buffer = []
-
-    def maybe_force_flush() -> None:
-        nonlocal last_forced_flush
-        if args.save_every <= 0:
-            return
-        if produced - last_forced_flush >= args.save_every:
-            flush_shards(force=True)
-            save_state(
-                args.state_path,
-                rows_seen=rows_seen,
-                written=written,
-                neg_pool=neg_pool,
-                extra={"missing_context_written": missing_context_written},
-            )
-            last_forced_flush = produced
+    buffer_flush_rows = args.save_every if args.save_every > 0 else args.shard_size
+    shard_writer = ParquetShardWriter(
+        out_dir=out_dir,
+        shard_size=args.shard_size,
+        compression=args.parquet_compression,
+    )
 
     def flush_pending() -> None:
         nonlocal pending, produced, missing_context_written
@@ -403,14 +367,17 @@ def main() -> None:
             produced += 1
 
         pending = []
-        flush_shards(force=False)
-        save_state(
-            args.state_path,
-            rows_seen=rows_seen,
-            written=written,
-            neg_pool=neg_pool,
-            extra={"missing_context_written": missing_context_written},
-        )
+        if len(out_buffer) >= buffer_flush_rows:
+            shard_writer.write_rows(out_buffer)
+            written += len(out_buffer)
+            out_buffer = []
+            save_state(
+                args.state_path,
+                rows_seen=rows_seen,
+                written=written,
+                neg_pool=neg_pool,
+                extra={"missing_context_written": missing_context_written},
+            )
         maybe_force_flush()
 
     pbar = tqdm(
@@ -421,135 +388,140 @@ def main() -> None:
         disable=not accelerator.is_local_main_process,
     )
 
-    for row in ds:
-        if produced >= args.max_samples:
-            break
-        rows_seen += 1
-        if skip_remaining > 0:
-            skip_remaining -= 1
-            continue
+    try:
+        for row in ds:
+            if produced >= args.max_samples:
+                break
+            rows_seen += 1
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                continue
 
-        if not valid_row(
-            row=row,
-            lang=args.lang,
-            min_context_chars=args.min_context_chars,
-            max_context_chars=args.max_context_chars,
-            max_query_chars=args.max_query_chars,
-        ):
-            continue
+            if not valid_row(
+                row=row,
+                lang=args.lang,
+                min_context_chars=args.min_context_chars,
+                max_context_chars=args.max_context_chars,
+                max_query_chars=args.max_query_chars,
+            ):
+                continue
 
-        query = row["query"].strip()
-        context = truncate_text(row["query_seed_text"], args.max_context_chars)
-        url = row.get("query_seed_url") or ""
-        seed_license = row.get("seed_license") or ""
-        synth_id = row.get("synth_id") or ""
+            query = row["query"].strip()
+            context = truncate_text(row["query_seed_text"], args.max_context_chars)
+            url = row.get("query_seed_url") or ""
+            seed_license = row.get("seed_license") or ""
+            synth_id = row.get("synth_id") or ""
 
-        # Always keep a positive candidate (may still become IDK if not answerable)
-        # We'll run inference for positives.
-        # Optionally add missing-context example
-        if (
-            args.missing_context_ratio > 0.0
-            and missing_context_written < args.missing_context_max
-            and random.random() < args.missing_context_ratio
-        ):
+            # Always keep a positive candidate (may still become IDK if not answerable)
+            # We'll run inference for positives.
+            # Optionally add missing-context example
+            if (
+                args.missing_context_ratio > 0.0
+                and missing_context_written < args.missing_context_max
+                and random.random() < args.missing_context_ratio
+            ):
+                pending.append(
+                    {
+                        "synth_id": synth_id,
+                        "query_seed_url": url,
+                        "seed_license": seed_license,
+                        "query": query,
+                        "context": "",
+                        "is_negative": True,
+                        "is_missing_context": True,
+                        "needs_infer": False,
+                        "force_idk": False,
+                        "prompt_text": "",
+                        "answer": args.missing_context_answer,
+                        "quotes": [],
+                    }
+                )
+                missing_context_written += 1
+
+            msg_prompt, _ = build_messages(
+                query=query,
+                context=context,
+                answer=None,
+                json_mode=args.use_json_mode,
+                system_prompt=system_prompt,
+                system_prompt_json=system_prompt_json,
+                idk_text=IDK,
+            )
+            prompt_text = tokenizer.apply_chat_template(
+                msg_prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
             pending.append(
                 {
                     "synth_id": synth_id,
                     "query_seed_url": url,
                     "seed_license": seed_license,
                     "query": query,
-                    "context": "",
-                    "is_negative": True,
-                    "is_missing_context": True,
-                    "needs_infer": False,
+                    "context": context,
+                    "is_negative": False,
+                    "needs_infer": True,
                     "force_idk": False,
-                    "prompt_text": "",
-                    "answer": args.missing_context_answer,
-                    "quotes": [],
+                    "prompt_text": prompt_text,
+                    "answer": "",
                 }
             )
-            missing_context_written += 1
 
-        msg_prompt, _ = build_messages(
-            query=query,
-            context=context,
-            answer=None,
-            json_mode=args.use_json_mode,
-            system_prompt=system_prompt,
-            system_prompt_json=system_prompt_json,
-            idk_text=IDK,
-        )
-        prompt_text = tokenizer.apply_chat_template(
-            msg_prompt,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        pending.append(
-            {
-                "synth_id": synth_id,
-                "query_seed_url": url,
-                "seed_license": seed_license,
-                "query": query,
-                "context": context,
-                "is_negative": False,
-                "needs_infer": True,
-                "force_idk": False,
-                "prompt_text": prompt_text,
-                "answer": "",
-            }
-        )
-
-        # Sometimes add a negative (mismatched context)
-        if len(neg_pool) >= args.neg_pool_warmup and random.random() < args.neg_ratio:
-            # sample a context from pool with a different URL when possible
-            ctx_neg, url_neg = random.choice(list(neg_pool))
-            tries = 0
-            while tries < 10 and url_neg == url:
+            # Sometimes add a negative (mismatched context)
+            if len(neg_pool) >= args.neg_pool_warmup and random.random() < args.neg_ratio:
+                # sample a context from pool with a different URL when possible
                 ctx_neg, url_neg = random.choice(list(neg_pool))
-                tries += 1
+                tries = 0
+                while tries < 10 and url_neg == url:
+                    ctx_neg, url_neg = random.choice(list(neg_pool))
+                    tries += 1
 
-            ctx_neg = truncate_text(ctx_neg, args.max_context_chars)
+                ctx_neg = truncate_text(ctx_neg, args.max_context_chars)
 
-            # For negatives, we generally *don't need* model inference; we force IDK
-            pending.append(
-                {
-                    "synth_id": synth_id,
-                    "query_seed_url": url,
-                    "seed_license": seed_license,
-                    "query": query,
-                    "context": ctx_neg,
-                    "is_negative": True,
-                    "needs_infer": False,  # change to True if you want model to generate IDK (slower, noisier)
-                    "force_idk": True,
-                    "prompt_text": "",
-                    "answer": IDK,
-                    "quotes": [],
-                }
-            )
+                # For negatives, we generally *don't need* model inference; we force IDK
+                pending.append(
+                    {
+                        "synth_id": synth_id,
+                        "query_seed_url": url,
+                        "seed_license": seed_license,
+                        "query": query,
+                        "context": ctx_neg,
+                        "is_negative": True,
+                        "needs_infer": False,  # change to True if you want model to generate IDK (slower, noisier)
+                        "force_idk": True,
+                        "prompt_text": "",
+                        "answer": IDK,
+                        "quotes": [],
+                    }
+                )
 
-        # Update negative pool
-        neg_pool.append((context, url))
+            # Update negative pool
+            neg_pool.append((context, url))
 
-        # Flush batches
-        if len(pending) >= args.batch_size:
-            flush_pending()
-            pbar.n = produced
-            pbar.refresh()
-
-    # final flush
-    flush_pending()
-    flush_shards(force=True)
-    pbar.n = produced
-    pbar.refresh()
-    pbar.close()
-    save_state(
-        args.state_path,
-        rows_seen=rows_seen,
-        written=written,
-        neg_pool=neg_pool,
-        extra={"missing_context_written": missing_context_written},
-    )
+            # Flush batches
+            if len(pending) >= args.batch_size:
+                flush_pending()
+                pbar.n = produced
+                pbar.refresh()
+    finally:
+        # final flush
+        flush_pending()
+        if out_buffer:
+            shard_writer.write_rows(out_buffer)
+            written += len(out_buffer)
+            out_buffer = []
+        shard_writer.close()
+        pbar.n = produced
+        pbar.refresh()
+        pbar.close()
+        save_state(
+            args.state_path,
+            rows_seen=rows_seen,
+            written=written,
+            neg_pool=neg_pool,
+            extra={"missing_context_written": missing_context_written},
+        )
 
     print(f"Done. Wrote {written} examples to {out_dir}")
 

@@ -167,3 +167,85 @@ def next_shard_idx(out_dir: str) -> int:
         except Exception:
             continue
     return max_idx + 1
+
+
+class ParquetShardWriter:
+    def __init__(self, out_dir: str, shard_size: int, compression: str) -> None:
+        self.out_dir = out_dir
+        self.shard_size = shard_size
+        self.compression = None if compression == "none" else compression
+        self.shard_idx = next_shard_idx(out_dir)
+        self.shard_rows = 0
+        self.schema = None
+        self.current_path = None
+        self.append_mode = False
+        self._prime_from_last_shard()
+
+    def _prime_from_last_shard(self) -> None:
+        """If the last shard exists and is not full, reopen it for append."""
+        import pyarrow.parquet as pq
+
+        last_idx = self.shard_idx - 1
+        if last_idx < 0:
+            return
+        path = os.path.join(self.out_dir, f"part-{last_idx:05d}.parquet")
+        if not os.path.exists(path):
+            return
+        pf = pq.ParquetFile(path)
+        rows = pf.metadata.num_rows
+        if rows >= self.shard_size:
+            return
+        self.schema = pf.schema_arrow
+        self.current_path = path
+        self.shard_idx = last_idx
+        self.shard_rows = rows
+        self.append_mode = True
+
+    def _next_path(self) -> str:
+        return os.path.join(self.out_dir, f"part-{self.shard_idx:05d}.parquet")
+
+    def write_rows(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("pyarrow is required for Parquet output. Install pyarrow.") from exc
+
+        i = 0
+        total = len(rows)
+        while i < total:
+            if self.schema is None:
+                # Initialize schema from first batch
+                table = pa.Table.from_pylist(rows[i : i + 1])
+                self.schema = table.schema
+                if self.current_path is None:
+                    self.current_path = self._next_path()
+
+            capacity = self.shard_size - self.shard_rows
+            take = min(capacity, total - i)
+            chunk = rows[i : i + take]
+            table = pa.Table.from_pylist(chunk, schema=self.schema)
+
+            pq.write_table(
+                table,
+                self.current_path,
+                compression=self.compression,
+                append=self.append_mode,
+            )
+            self.append_mode = True  # subsequent writes append
+            self.shard_rows += take
+            i += take
+
+            if self.shard_rows >= self.shard_size:
+                self.close()
+                self.shard_idx += 1
+                self.shard_rows = 0
+                self.schema = None
+                self.current_path = None
+                self.append_mode = False
+
+    def close(self) -> None:
+        # nothing to do; writes are closed per call
+        self.append_mode = False
