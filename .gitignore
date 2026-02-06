@@ -1,0 +1,43 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PyTorch / HF caches & checkpoints
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+outputs/
+wandb/
+mlruns/
+
+# Data
+data/
+*.jsonl
+*.json
+*.csv
+*.tsv
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/

@@ -1,0 +1,7 @@
+transformers>=4.51.0
+datasets>=2.18.0
+accelerate>=0.30.0
+torch
+tqdm
+peft>=0.10.0
+gradio>=4.0.0
