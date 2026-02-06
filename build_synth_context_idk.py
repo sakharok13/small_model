@@ -379,7 +379,6 @@ def main() -> None:
                 neg_pool=neg_pool,
                 extra={"missing_context_written": missing_context_written},
             )
-        maybe_force_flush()
 
     pbar = tqdm(
         total=args.max_samples,

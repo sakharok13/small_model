@@ -228,11 +228,15 @@ class ParquetShardWriter:
             chunk = rows[i : i + take]
             table = pa.Table.from_pylist(chunk, schema=self.schema)
 
+            if self.append_mode and os.path.exists(self.current_path):
+                # Read existing data and concatenate before overwriting
+                existing = pq.read_table(self.current_path, schema=self.schema)
+                table = pa.concat_tables([existing, table])
+
             pq.write_table(
                 table,
                 self.current_path,
                 compression=self.compression,
-                append=self.append_mode,
             )
             self.append_mode = True  # subsequent writes append
             self.shard_rows += take
