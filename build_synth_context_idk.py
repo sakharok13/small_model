@@ -20,6 +20,7 @@ Qwen3 recommends transformers>=4.51.0.
 """
 
 import argparse
+import ast
 import json
 import os
 import random
@@ -149,6 +150,31 @@ def extract_json_obj(s: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def load_state(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as fh:
+        try:
+            return json.load(fh)
+        except Exception:
+            return {}
+
+
+def save_state(path: str, rows_seen: int, written: int, neg_pool: Deque[Tuple[str, str]]) -> None:
+    if not path:
+        return
+    state = {
+        "rows_seen": rows_seen,
+        "written": written,
+        "random_state": repr(random.getstate()),
+        "neg_pool": list(neg_pool),
+    }
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 @torch.inference_mode()
 def generate_batch_hf(
     model,
@@ -233,6 +259,8 @@ def main() -> None:
     ap.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.90, help="vLLM GPU memory utilization fraction")
     ap.add_argument("--vllm_max_model_len", type=int, default=8192, help="vLLM max model length")
     ap.add_argument("--vllm_dtype", type=str, default="auto", help="vLLM dtype: auto|float16|bfloat16|float32")
+    ap.add_argument("--state_path", type=str, default="", help="Path to resume state (default: out_jsonl + .state.json)")
+    ap.add_argument("--resume", action="store_true", help="Resume from state file and append to out_jsonl")
 
     args = ap.parse_args()
     if args.no_json_mode:
@@ -241,6 +269,19 @@ def main() -> None:
     random.seed(args.seed)
 
     os.makedirs(os.path.dirname(args.out_jsonl) or ".", exist_ok=True)
+    if not args.state_path:
+        args.state_path = f"{args.out_jsonl}.state.json"
+
+    state = load_state(args.state_path) if args.resume else {}
+    resume_rows = int(state.get("rows_seen", 0))
+    rows_seen = resume_rows if args.resume else 0
+    written = int(state.get("written", 0)) if args.resume else 0
+    if args.resume and state.get("random_state"):
+        try:
+            random.setstate(ast.literal_eval(state["random_state"]))
+        except Exception:
+            # fall back to seed if state is corrupted
+            random.seed(args.seed)
 
     # Load model/tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
@@ -272,9 +313,24 @@ def main() -> None:
 
     # Stream SYNTH (it's massive)
     ds = load_dataset(args.dataset, split=args.split, streaming=True)
+    skip_remaining = 0
+    if args.resume and resume_rows > 0:
+        try:
+            ds = ds.skip(resume_rows)
+            skip_remaining = 0
+            rows_seen = resume_rows
+        except Exception:
+            # fallback: manual skipping in loop
+            skip_remaining = resume_rows
+            rows_seen = 0
 
     neg_pool: Deque[Tuple[str, str]] = deque(maxlen=args.neg_pool_size)  # (context, url)
-    written = 0
+    if args.resume and state.get("neg_pool"):
+        try:
+            for ctx, url in state.get("neg_pool", []):
+                neg_pool.append((ctx, url))
+        except Exception:
+            neg_pool.clear()
 
     # We'll accumulate inference jobs and flush in batches
     pending: List[Dict[str, Any]] = []
@@ -390,13 +446,19 @@ def main() -> None:
             written += 1
 
         pending = []
+        save_state(args.state_path, rows_seen=rows_seen, written=written, neg_pool=neg_pool)
 
-    with open(args.out_jsonl, "w", encoding="utf-8") as fh:
-        pbar = tqdm(total=args.max_samples, desc="writing examples", unit="ex")
+    out_mode = "a" if args.resume else "w"
+    with open(args.out_jsonl, out_mode, encoding="utf-8") as fh:
+        pbar = tqdm(total=args.max_samples, desc="writing examples", unit="ex", initial=written)
 
         for row in ds:
             if written >= args.max_samples:
                 break
+            rows_seen += 1
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                continue
 
             if not valid_row(
                 row=row,
@@ -480,6 +542,7 @@ def main() -> None:
         pbar.n = written
         pbar.refresh()
         pbar.close()
+        save_state(args.state_path, rows_seen=rows_seen, written=written, neg_pool=neg_pool)
 
     print(f"Done. Wrote {written} examples to {args.out_jsonl}")
 
