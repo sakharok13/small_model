@@ -146,6 +146,7 @@ def main() -> None:
     ap.add_argument("--missing_context_max", type=int, default=1000, help="Maximum missing-context examples to add")
     ap.add_argument("--missing_context_answer", type=str, default=NO_CONTEXT_ANSWER, help="Answer when context is missing")
     ap.add_argument("--shard_size", type=int, default=50_000, help="Examples per Parquet shard")
+    ap.add_argument("--save_every", type=int, default=5000, help="Force a shard flush every N examples (0 to disable)")
     ap.add_argument("--parquet_compression", type=str, default="zstd", help="Parquet compression codec (zstd|snappy|gzip|none)")
 
     ap.add_argument("--min_context_chars", type=int, default=300)
@@ -274,6 +275,7 @@ def main() -> None:
     out_buffer: List[Dict[str, Any]] = []
     produced = written
     shard_idx = next_shard_idx(out_dir)
+    last_forced_flush = produced
 
     def write_shard(rows: List[Dict[str, Any]]) -> None:
         nonlocal written, shard_idx
@@ -304,6 +306,21 @@ def main() -> None:
         if force and out_buffer:
             write_shard(out_buffer)
             out_buffer = []
+
+    def maybe_force_flush() -> None:
+        nonlocal last_forced_flush
+        if args.save_every <= 0:
+            return
+        if produced - last_forced_flush >= args.save_every:
+            flush_shards(force=True)
+            save_state(
+                args.state_path,
+                rows_seen=rows_seen,
+                written=written,
+                neg_pool=neg_pool,
+                extra={"missing_context_written": missing_context_written},
+            )
+            last_forced_flush = produced
 
     def flush_pending() -> None:
         nonlocal pending, produced, missing_context_written
@@ -394,6 +411,7 @@ def main() -> None:
             neg_pool=neg_pool,
             extra={"missing_context_written": missing_context_written},
         )
+        maybe_force_flush()
 
     pbar = tqdm(
         total=args.max_samples,
