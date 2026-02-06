@@ -329,7 +329,7 @@ def main() -> None:
     )
 
     def flush_pending() -> None:
-        nonlocal pending, produced, missing_context_written, out_buffer
+        nonlocal pending, produced, missing_context_written, out_buffer, written
         if not pending:
             return
 
