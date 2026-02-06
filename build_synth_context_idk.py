@@ -224,6 +224,7 @@ def main() -> None:
 
     # Load model/tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
+    tokenizer.padding_side = "left"
     # Ensure pad token exists
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -244,7 +245,7 @@ def main() -> None:
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name,
-            torch_dtype="auto",
+            dtype="auto",
             device_map=None if world > 1 else "auto",
             trust_remote_code=args.trust_remote_code,
         )
@@ -287,7 +288,7 @@ def main() -> None:
     )
 
     def flush_pending() -> None:
-        nonlocal pending, produced, missing_context_written
+        nonlocal pending, produced, missing_context_written, out_buffer
         if not pending:
             return
 
