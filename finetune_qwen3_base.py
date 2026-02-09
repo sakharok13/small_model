@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import inspect
 import json
 import os
 import random
@@ -369,6 +370,63 @@ def register_special_tokens(tokenizer: AutoTokenizer, args: argparse.Namespace) 
     return tokenizer.add_special_tokens({"additional_special_tokens": uniq})
 
 
+def build_model_load_kwargs(args: argparse.Namespace, dtype: Optional[torch.dtype]) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {"trust_remote_code": args.trust_remote_code}
+    if dtype is None:
+        return kwargs
+    sig = inspect.signature(AutoModelForCausalLM.from_pretrained)
+    if "dtype" in sig.parameters:
+        kwargs["dtype"] = dtype
+    else:
+        kwargs["torch_dtype"] = dtype
+    return kwargs
+
+
+def build_training_arguments(args: argparse.Namespace, eval_enabled: bool) -> TrainingArguments:
+    sig = inspect.signature(TrainingArguments.__init__)
+    allowed = set(sig.parameters.keys())
+
+    eval_strategy_value = args.evaluation_strategy if eval_enabled else "no"
+    kwargs: Dict[str, Any] = {
+        "output_dir": args.output_dir,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "per_device_eval_batch_size": args.per_device_eval_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "num_train_epochs": args.num_train_epochs,
+        "weight_decay": args.weight_decay,
+        "warmup_ratio": args.warmup_ratio,
+        "lr_scheduler_type": args.lr_scheduler_type,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "save_total_limit": args.save_total_limit,
+        "report_to": args.report_to,
+        "seed": args.seed,
+        "bf16": args.bf16,
+        "fp16": args.fp16,
+        "remove_unused_columns": False,
+        "optim": "adamw_torch",
+        "ddp_backend": args.ddp_backend,
+        "ddp_find_unused_parameters": args.ddp_find_unused_parameters,
+        "eval_steps": args.eval_steps,
+    }
+
+    if args.run_name:
+        kwargs["run_name"] = args.run_name
+    if args.logging_dir:
+        kwargs["logging_dir"] = args.logging_dir
+
+    # transformers version compatibility:
+    # old-style: evaluation_strategy; newer-style: eval_strategy
+    if "evaluation_strategy" in allowed:
+        kwargs["evaluation_strategy"] = eval_strategy_value
+    if "eval_strategy" in allowed:
+        kwargs["eval_strategy"] = eval_strategy_value
+
+    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    return TrainingArguments(**filtered)
+
+
 def main() -> None:
     args = parse_args()
     if args.no_filter_long:
@@ -448,11 +506,8 @@ def main() -> None:
     elif args.fp16:
         dtype = torch.float16
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=dtype,
-        trust_remote_code=args.trust_remote_code,
-    )
+    model_load_kwargs = build_model_load_kwargs(args=args, dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_load_kwargs)
     if num_added_tokens > 0:
         model.resize_token_embeddings(len(tokenizer))
 
@@ -480,33 +535,7 @@ def main() -> None:
         args=args,
     )
 
-    eval_strategy = args.evaluation_strategy if eval_ds is not None else "no"
-    train_args = TrainingArguments(
-        output_dir=args.output_dir,
-        run_name=args.run_name if args.run_name else None,
-        logging_dir=args.logging_dir if args.logging_dir else None,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        num_train_epochs=args.num_train_epochs,
-        weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
-        lr_scheduler_type=args.lr_scheduler_type,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        report_to=args.report_to,
-        seed=args.seed,
-        bf16=args.bf16,
-        fp16=args.fp16,
-        remove_unused_columns=False,
-        optim="adamw_torch",
-        ddp_backend=args.ddp_backend,
-        ddp_find_unused_parameters=args.ddp_find_unused_parameters,
-        evaluation_strategy=eval_strategy,
-        eval_steps=args.eval_steps,
-    )
+    train_args = build_training_arguments(args=args, eval_enabled=(eval_ds is not None))
 
     trainer = Trainer(
         model=model,
