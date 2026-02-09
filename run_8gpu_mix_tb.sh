@@ -21,6 +21,7 @@ MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-0.6B}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 SEED="${SEED:-42}"
 VAL_PER_GROUP="${VAL_PER_GROUP:-5000}"
+LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-0}"
 
 # Predefined mixture
 MIX_RATIOS="${MIX_RATIOS:-correct:0.70,refusal:0.15,negative:0.15}"
@@ -74,6 +75,22 @@ if [[ "${GPU_COUNT}" -lt "${NPROC_PER_NODE}" ]]; then
   exit 1
 fi
 
+REPORT_TO="$(python3 - <<'PY'
+try:
+    import tensorboard  # noqa: F401
+    print("tensorboard")
+except Exception:
+    try:
+        import tensorboardX  # noqa: F401
+        print("tensorboard")
+    except Exception:
+        print("none")
+PY
+)"
+if [[ "${REPORT_TO}" == "none" ]]; then
+  echo "TensorBoard package not found; falling back to --report_to none."
+fi
+
 echo "[1/4] Preparing grouped splits"
 if [[ ! -f "${SPLITS_DIR}/stats.json" || "${REBUILD_SPLITS:-0}" == "1" ]]; then
   mkdir -p "${SPLITS_DIR}"
@@ -124,6 +141,8 @@ echo "NPROC_PER_NODE=${NPROC_PER_NODE}"
 echo "MIX_RATIOS=${MIX_RATIOS}"
 echo "TARGET_TRAIN_SAMPLES=${TARGET_TRAIN_SAMPLES}"
 echo "EPOCHS=${EPOCHS} (max 1.0 enforced)"
+echo "REPORT_TO=${REPORT_TO}"
+echo "LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY}"
 
 SUMMARY_JSONL="${RUNS_DIR}/summary.jsonl"
 : > "${SUMMARY_JSONL}"
@@ -143,7 +162,11 @@ for LR in "${LRS[@]}"; do
     mkdir -p "${OUT_DIR}" "${LOG_DIR}"
 
     echo ">> [${RUN_IDX}/${TOTAL_RUNS}] ${RUN_NAME}"
-    torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" finetune_qwen3_base.py \
+    EXTRA_FLAGS=()
+    if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
+      EXTRA_FLAGS+=(--local_files_only)
+    fi
+    torchrun --standalone --master_addr 127.0.0.1 --nproc_per_node="${NPROC_PER_NODE}" finetune_qwen3_base.py \
       --model_name "${MODEL_NAME}" \
       --output_dir "${OUT_DIR}" \
       --run_name "${RUN_NAME}" \
@@ -170,10 +193,11 @@ for LR in "${LRS[@]}"; do
       --save_steps "${SAVE_STEPS}" \
       --save_total_limit 1 \
       --logging_steps "${LOGGING_STEPS}" \
-      --report_to tensorboard \
+      --report_to "${REPORT_TO}" \
       --seed "${SEED}" \
       --bf16 \
-      --gradient_checkpointing
+      --gradient_checkpointing \
+      "${EXTRA_FLAGS[@]}"
 
     python3 - <<PY
 import json
@@ -252,5 +276,7 @@ if rows:
 PY
 
 echo "Done."
-echo "TensorBoard command:"
-echo "tensorboard --logdir ${TB_ROOT} --host 0.0.0.0 --port 6006"
+if [[ "${REPORT_TO}" == "tensorboard" ]]; then
+  echo "TensorBoard command:"
+  echo "tensorboard --logdir ${TB_ROOT} --host 0.0.0.0 --port 6006"
+fi

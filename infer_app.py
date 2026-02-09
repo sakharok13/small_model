@@ -138,7 +138,7 @@ def main() -> None:
 
     def infer(query: str, context: str) -> Generator[str, None, None]:
         prompt = build_prompt(query, context, args.prompt_template)
-        return generate_stream(
+        yield from generate_stream(
             model=model,
             tokenizer=tokenizer,
             prompt=prompt,
@@ -158,7 +158,7 @@ def main() -> None:
 
         btn.click(fn=infer, inputs=[query, context], outputs=answer)
 
-    demo.queue().launch(server_name=args.host, server_port=args.port)
+    demo.queue().launch(server_name=args.host, server_port=args.port, share=True)
 
 
 if __name__ == "__main__":

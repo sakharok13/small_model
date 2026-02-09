@@ -13,6 +13,7 @@ TB_ROOT="${RUNS_DIR}/tensorboard"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-0.6B}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 SEED="${SEED:-42}"
+LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-0}"
 
 # Fixed train setup so the only variable is the mixture split.
 EPOCHS="${EPOCHS:-1.0}"   # must be <= 1.0
@@ -64,6 +65,22 @@ if [[ "${GPU_COUNT}" -lt "${NPROC_PER_NODE}" ]]; then
   exit 1
 fi
 
+REPORT_TO="$(python3 - <<'PY'
+try:
+    import tensorboard  # noqa: F401
+    print("tensorboard")
+except Exception:
+    try:
+        import tensorboardX  # noqa: F401
+        print("tensorboard")
+    except Exception:
+        print("none")
+PY
+)"
+if [[ "${REPORT_TO}" == "none" ]]; then
+  echo "TensorBoard package not found; falling back to --report_to none."
+fi
+
 if [[ ! -f "${SPLITS_DIR}/stats.json" ]]; then
   echo "Missing ${SPLITS_DIR}/stats.json. Run prepare_sft_splits.py first."
   exit 1
@@ -108,6 +125,8 @@ PY
 echo "RUNS_DIR=${RUNS_DIR}"
 echo "TARGET_TRAIN_SAMPLES=${TARGET_TRAIN_SAMPLES}"
 echo "EPOCHS=${EPOCHS}"
+echo "REPORT_TO=${REPORT_TO}"
+echo "LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY}"
 echo "Checking ${#MIXTURES[@]} mixture splits..."
 
 IDX=0
@@ -119,7 +138,11 @@ for MIX in "${MIXTURES[@]}"; do
   mkdir -p "${OUT_DIR}" "${LOG_DIR}"
 
   echo ">> ${RUN_NAME}"
-  torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" finetune_qwen3_base.py \
+  EXTRA_FLAGS=()
+  if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
+    EXTRA_FLAGS+=(--local_files_only)
+  fi
+  torchrun --standalone --master_addr 127.0.0.1 --nproc_per_node="${NPROC_PER_NODE}" finetune_qwen3_base.py \
     --model_name "${MODEL_NAME}" \
     --output_dir "${OUT_DIR}" \
     --run_name "${RUN_NAME}" \
@@ -146,10 +169,11 @@ for MIX in "${MIXTURES[@]}"; do
     --save_steps "${SAVE_STEPS}" \
     --save_total_limit 1 \
     --logging_steps "${LOGGING_STEPS}" \
-    --report_to tensorboard \
+    --report_to "${REPORT_TO}" \
     --seed "${SEED}" \
     --bf16 \
-    --gradient_checkpointing
+    --gradient_checkpointing \
+    "${EXTRA_FLAGS[@]}"
 
   python3 - <<PY
 import json
@@ -213,5 +237,7 @@ if rows:
     print("Best:", rows[0].get("run_name"), rows[0].get("mix"), "mean_group_loss=", rows[0].get("mean_group_loss"))
 PY
 
-echo "TensorBoard:"
-echo "tensorboard --logdir ${TB_ROOT} --host 0.0.0.0 --port 6006"
+if [[ "${REPORT_TO}" == "tensorboard" ]]; then
+  echo "TensorBoard:"
+  echo "tensorboard --logdir ${TB_ROOT} --host 0.0.0.0 --port 6006"
+fi

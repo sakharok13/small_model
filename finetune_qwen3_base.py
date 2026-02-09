@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--output_dir", type=str, default="outputs/qwen3_small_idk")
     ap.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Base model name")
     ap.add_argument("--trust_remote_code", action="store_true")
+    ap.add_argument("--local_files_only", action="store_true", help="Load model/tokenizer from local HF cache only")
     ap.add_argument("--max_seq_len", type=int, default=2048)
 
     # Backward compatibility path (JSONL).
@@ -371,7 +372,10 @@ def register_special_tokens(tokenizer: AutoTokenizer, args: argparse.Namespace) 
 
 
 def build_model_load_kwargs(args: argparse.Namespace, dtype: Optional[torch.dtype]) -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = {"trust_remote_code": args.trust_remote_code}
+    kwargs: Dict[str, Any] = {
+        "trust_remote_code": args.trust_remote_code,
+        "local_files_only": args.local_files_only,
+    }
     if dtype is None:
         return kwargs
     sig = inspect.signature(AutoModelForCausalLM.from_pretrained)
@@ -434,7 +438,11 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name,
+        trust_remote_code=args.trust_remote_code,
+        local_files_only=args.local_files_only,
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
