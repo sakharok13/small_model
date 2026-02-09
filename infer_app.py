@@ -75,6 +75,13 @@ def generate_stream(
         skip_special_tokens=True,
     )
 
+    eos_ids = [tokenizer.eos_token_id]
+    answer_end_id = tokenizer.convert_tokens_to_ids(answer_end) if answer_end else None
+    if isinstance(answer_end_id, int) and answer_end_id >= 0 and answer_end_id != tokenizer.unk_token_id:
+        eos_ids.append(answer_end_id)
+    # Deduplicate while preserving order
+    eos_ids = list(dict.fromkeys(eos_ids))
+
     gen_kwargs = dict(
         **inputs,
         max_new_tokens=max_new_tokens,
@@ -82,7 +89,7 @@ def generate_stream(
         temperature=temperature,
         top_p=top_p,
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        eos_token_id=eos_ids if len(eos_ids) > 1 else eos_ids[0],
         streamer=streamer,
     )
 
