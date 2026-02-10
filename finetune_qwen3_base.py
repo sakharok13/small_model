@@ -7,7 +7,8 @@ import json
 import os
 import random
 from glob import glob
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from datasets import Dataset, concatenate_datasets, load_dataset
@@ -55,6 +56,29 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--max_train_samples", type=int, default=0, help="Optional hard cap after mixing")
     ap.add_argument("--allow_oversample", action="store_true", help="Allow sampling with replacement for group mixing")
+
+    # Optional HotpotQA augmentation.
+    ap.add_argument("--add_hotpot_train", action="store_true", help="Append HotpotQA train examples to the training set")
+    ap.add_argument("--hotpot_dataset_name", type=str, default="hotpot_qa")
+    ap.add_argument("--hotpot_dataset_config", type=str, default="distractor")
+    ap.add_argument("--hotpot_train_split", type=str, default="train")
+    ap.add_argument(
+        "--hotpot_context_mode",
+        type=str,
+        choices=["all", "gold_titles", "supporting"],
+        default="all",
+        help=(
+            "all: all context docs/sentences; "
+            "gold_titles: all sentences from supporting-fact titles; "
+            "supporting: only supporting-fact sentences."
+        ),
+    )
+    ap.add_argument(
+        "--hotpot_max_context_chars",
+        type=int,
+        default=6000,
+        help="Hard cap on HotpotQA context chars (0 disables cap).",
+    )
 
     # Special token setup.
     ap.add_argument("--context_start_token", type=str, default="[context_start]")
@@ -371,6 +395,145 @@ def register_special_tokens(tokenizer: AutoTokenizer, args: argparse.Namespace) 
     return tokenizer.add_special_tokens({"additional_special_tokens": uniq})
 
 
+def parse_context_field(raw: Any) -> List[Tuple[str, List[str]]]:
+    out: List[Tuple[str, List[str]]] = []
+    if isinstance(raw, dict):
+        titles = raw.get("title") or []
+        sents = raw.get("sentences") or []
+        for title, sent_list in zip(titles, sents):
+            if isinstance(sent_list, str):
+                sent_list = [sent_list]
+            if not isinstance(sent_list, list):
+                sent_list = []
+            out.append((str(title), [str(x) for x in sent_list]))
+        return out
+
+    if isinstance(raw, list):
+        for item in raw:
+            title = ""
+            sent_list: List[str] = []
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                title = str(item[0])
+                if isinstance(item[1], str):
+                    sent_list = [item[1]]
+                elif isinstance(item[1], list):
+                    sent_list = [str(x) for x in item[1]]
+            elif isinstance(item, dict):
+                title = str(item.get("title") or "")
+                s = item.get("sentences") or item.get("sentence") or []
+                if isinstance(s, str):
+                    sent_list = [s]
+                elif isinstance(s, list):
+                    sent_list = [str(x) for x in s]
+            if title or sent_list:
+                out.append((title, sent_list))
+    return out
+
+
+def parse_supporting_facts(raw: Any) -> Tuple[Set[Tuple[str, int]], Set[str]]:
+    pairs: Set[Tuple[str, int]] = set()
+    titles: Set[str] = set()
+    if isinstance(raw, dict):
+        raw_titles = raw.get("title") or []
+        raw_ids = raw.get("sent_id") or []
+        for title, sid in zip(raw_titles, raw_ids):
+            try:
+                sid_int = int(sid)
+            except Exception:
+                continue
+            t = str(title)
+            pairs.add((t, sid_int))
+            titles.add(t)
+        return pairs, titles
+
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            title = str(item[0])
+            try:
+                sid_int = int(item[1])
+            except Exception:
+                continue
+            pairs.add((title, sid_int))
+            titles.add(title)
+    return pairs, titles
+
+
+def format_doc(title: str, sentences: Sequence[str]) -> str:
+    text = " ".join(x.strip() for x in sentences if str(x).strip()).strip()
+    if not text:
+        return ""
+    if title.strip():
+        return f"{title.strip()}\n{text}"
+    return text
+
+
+def build_hotpot_context(example: Dict[str, Any], mode: str, max_context_chars: int) -> str:
+    docs = parse_context_field(example.get("context"))
+    sf_pairs, sf_titles = parse_supporting_facts(example.get("supporting_facts"))
+
+    selected: List[Tuple[str, List[str]]] = []
+    if mode == "all":
+        selected = docs
+    elif mode == "gold_titles":
+        selected = [(title, sents) for title, sents in docs if title in sf_titles]
+        if not selected:
+            selected = docs
+    else:
+        by_title: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+        for title, sents in docs:
+            for i, sent in enumerate(sents):
+                if (title, i) in sf_pairs:
+                    by_title[title].append((i, sent))
+        for title, _ in docs:
+            if title not in by_title:
+                continue
+            ranked = sorted(by_title[title], key=lambda t: t[0])
+            selected.append((title, [x[1] for x in ranked]))
+        if not selected:
+            selected = docs
+
+    blocks = []
+    for title, sents in selected:
+        block = format_doc(title=title, sentences=sents)
+        if block:
+            blocks.append(block)
+    ctx = "\n\n".join(blocks).strip()
+    if max_context_chars > 0 and len(ctx) > max_context_chars:
+        return ctx[:max_context_chars].rstrip()
+    return ctx
+
+
+def load_hotpot_train_dataset(args: argparse.Namespace) -> Dataset:
+    ds = load_dataset(
+        args.hotpot_dataset_name,
+        args.hotpot_dataset_config,
+        split=args.hotpot_train_split,
+    )
+
+    def to_qa(example: Dict[str, Any]) -> Dict[str, Any]:
+        query = str(example.get("question") or "").strip()
+        answer = str(example.get("answer") or "").strip()
+        context = build_hotpot_context(
+            example,
+            mode=args.hotpot_context_mode,
+            max_context_chars=args.hotpot_max_context_chars,
+        )
+        return {
+            "query": query,
+            "context": context,
+            "answer": answer,
+            "example_type": "correct",
+            "source": "hotpotqa_train",
+        }
+
+    remove_cols = ds.column_names
+    ds = ds.map(to_qa, remove_columns=remove_cols, desc="Converting HotpotQA -> query/context/answer")
+    ds = ds.filter(lambda ex: bool(ex["query"]) and bool(ex["answer"]))
+    return ds
+
+
 def build_model_load_kwargs(args: argparse.Namespace, dtype: Optional[torch.dtype]) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
         "trust_remote_code": args.trust_remote_code,
@@ -435,6 +598,10 @@ def main() -> None:
     args = parse_args()
     if args.no_filter_long:
         args.filter_long = False
+    if args.add_hotpot_train and args.filter_long:
+        # Keep all Hotpot training examples as requested.
+        print("HotpotQA train is enabled; disabling --filter_long so all Hotpot train examples are seen.")
+        args.filter_long = False
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -459,6 +626,7 @@ def main() -> None:
         split_name="train",
     )
     mix_stats: Dict[str, Any] = {}
+    train_ds: Optional[Dataset] = None
     if train_grouped is not None:
         train_ds, mix_stats = build_mixed_train_dataset(train_grouped, args)
     elif args.data_jsonl:
@@ -466,9 +634,24 @@ def main() -> None:
         ensure_columns(train_ds, name="train_jsonl")
     else:
         train_paths = expand_paths(args.train_files)
-        if not train_paths:
-            raise ValueError("Provide train data using grouped files or --train_files/--data_jsonl")
-        train_ds = load_parquet_dataset(train_paths, name="train")
+        if train_paths:
+            train_ds = load_parquet_dataset(train_paths, name="train")
+
+    if args.add_hotpot_train:
+        hotpot_ds = load_hotpot_train_dataset(args)
+        print(f"Loaded HotpotQA train rows: {len(hotpot_ds)}")
+        if train_ds is None:
+            train_ds = hotpot_ds
+            mix_stats["hotpot_only"] = True
+        else:
+            train_ds = concatenate_datasets([train_ds, hotpot_ds]).shuffle(seed=args.seed)
+            mix_stats["hotpot_rows_appended"] = len(hotpot_ds)
+
+    if train_ds is None:
+        raise ValueError(
+            "Provide train data using grouped files or --train_files/--data_jsonl, "
+            "or enable --add_hotpot_train."
+        )
 
     train_ds = maybe_cap_dataset(train_ds, max_samples=args.max_train_samples, seed=args.seed)
     if len(train_ds) == 0:

@@ -22,6 +22,12 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 SEED="${SEED:-42}"
 VAL_PER_GROUP="${VAL_PER_GROUP:-5000}"
 LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-0}"
+ADD_HOTPOT_TRAIN="${ADD_HOTPOT_TRAIN:-0}"
+HOTPOT_DATASET_NAME="${HOTPOT_DATASET_NAME:-hotpot_qa}"
+HOTPOT_DATASET_CONFIG="${HOTPOT_DATASET_CONFIG:-distractor}"
+HOTPOT_TRAIN_SPLIT="${HOTPOT_TRAIN_SPLIT:-train}"
+HOTPOT_CONTEXT_MODE="${HOTPOT_CONTEXT_MODE:-all}"
+HOTPOT_MAX_CONTEXT_CHARS="${HOTPOT_MAX_CONTEXT_CHARS:-6000}"
 
 # Predefined mixture
 MIX_RATIOS="${MIX_RATIOS:-correct:0.70,refusal:0.15,negative:0.15}"
@@ -143,6 +149,7 @@ echo "TARGET_TRAIN_SAMPLES=${TARGET_TRAIN_SAMPLES}"
 echo "EPOCHS=${EPOCHS} (max 1.0 enforced)"
 echo "REPORT_TO=${REPORT_TO}"
 echo "LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY}"
+echo "ADD_HOTPOT_TRAIN=${ADD_HOTPOT_TRAIN}"
 
 SUMMARY_JSONL="${RUNS_DIR}/summary.jsonl"
 : > "${SUMMARY_JSONL}"
@@ -165,6 +172,16 @@ for LR in "${LRS[@]}"; do
     EXTRA_FLAGS=()
     if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
       EXTRA_FLAGS+=(--local_files_only)
+    fi
+    if [[ "${ADD_HOTPOT_TRAIN}" == "1" ]]; then
+      EXTRA_FLAGS+=(
+        --add_hotpot_train
+        --hotpot_dataset_name "${HOTPOT_DATASET_NAME}"
+        --hotpot_dataset_config "${HOTPOT_DATASET_CONFIG}"
+        --hotpot_train_split "${HOTPOT_TRAIN_SPLIT}"
+        --hotpot_context_mode "${HOTPOT_CONTEXT_MODE}"
+        --hotpot_max_context_chars "${HOTPOT_MAX_CONTEXT_CHARS}"
+      )
     fi
     torchrun --standalone --master_addr 127.0.0.1 --nproc_per_node="${NPROC_PER_NODE}" finetune_qwen3_base.py \
       --model_name "${MODEL_NAME}" \
