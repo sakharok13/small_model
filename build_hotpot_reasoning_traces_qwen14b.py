@@ -123,6 +123,23 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.90)
     ap.add_argument("--vllm_max_model_len", type=int, default=8192)
     ap.add_argument("--vllm_dtype", type=str, default="auto")
+    vllm_eager_group = ap.add_mutually_exclusive_group()
+    vllm_eager_group.add_argument("--vllm_enforce_eager", dest="vllm_enforce_eager", action="store_true")
+    vllm_eager_group.add_argument("--vllm_no_enforce_eager", dest="vllm_enforce_eager", action="store_false")
+    ap.set_defaults(vllm_enforce_eager=True)
+    vllm_sanitize_group = ap.add_mutually_exclusive_group()
+    vllm_sanitize_group.add_argument(
+        "--vllm_sanitize_dist_env",
+        dest="vllm_sanitize_dist_env",
+        action="store_true",
+        help="Unset torch.distributed env vars before creating each vLLM instance.",
+    )
+    vllm_sanitize_group.add_argument(
+        "--vllm_no_sanitize_dist_env",
+        dest="vllm_sanitize_dist_env",
+        action="store_false",
+    )
+    ap.set_defaults(vllm_sanitize_dist_env=True)
     ap.add_argument(
         "--distributed_output_mode",
         type=str,
@@ -493,6 +510,29 @@ def pin_vllm_to_single_gpu(local_rank: int) -> str:
     return gpu
 
 
+def sanitize_dist_env_for_vllm() -> None:
+    # accelerate/torchrun env leaks into vLLM worker subprocesses and can cause hangs.
+    keys = [
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "GROUP_RANK",
+        "ROLE_RANK",
+        "ROLE_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "TORCHELASTIC_RUN_ID",
+        "TORCHELASTIC_ERROR_FILE",
+        "TORCHELASTIC_RESTART_COUNT",
+        "TORCHELASTIC_MAX_RESTARTS",
+    ]
+    for key in keys:
+        os.environ.pop(key, None)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29599")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -508,12 +548,15 @@ def main() -> None:
             os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
             os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
             os.environ.setdefault("NCCL_SOCKET_FAMILY", "AF_INET")
+            os.environ.setdefault("GLOO_USE_IPV6", "0")
             bound_gpu = pin_vllm_to_single_gpu(local_rank=local_rank)
             if is_local_main:
                 print(
                     f"[vLLM multi-proc] world={world} | this rank={rank} "
                     f"local_rank={local_rank} on GPU {bound_gpu}"
                 )
+            if args.vllm_sanitize_dist_env:
+                sanitize_dist_env_for_vllm()
     else:
         from accelerate import Accelerator
 
@@ -550,7 +593,7 @@ def main() -> None:
             gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             max_model_len=args.vllm_max_model_len,
             dtype=args.vllm_dtype,
-            trust_remote_code=args.trust_remote_code,
+            enforce_eager=args.vllm_enforce_eager,
         )
     else:
         dtype: Any = "auto"
