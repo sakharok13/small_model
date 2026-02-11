@@ -81,7 +81,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dataset_name", type=str, default="hotpot_qa")
     ap.add_argument("--dataset_config", type=str, default="distractor")
     ap.add_argument("--split", type=str, default="train")
-    ap.add_argument("--max_samples", type=int, default=500_000)
+    ap.add_argument(
+        "--max_samples",
+        type=int,
+        default=0,
+        help="0 means use full local Hotpot split shard; >0 caps rows globally across ranks.",
+    )
     ap.add_argument("--seed", type=int, default=42)
 
     ap.add_argument("--context_mode", type=str, choices=["all", "gold_titles", "supporting"], default="all")
@@ -107,6 +112,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top_p", type=float, default=None)
     ap.add_argument("--top_k", type=int, default=None)
+    ap.add_argument("--min_p", type=float, default=0.0, help="Qwen3 thinking default is 0")
 
     ap.add_argument("--shard_size", type=int, default=50_000)
     ap.add_argument("--save_every", type=int, default=5_000)
@@ -125,8 +131,8 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = ap.parse_args()
-    if args.max_samples <= 0:
-        raise ValueError("--max_samples must be > 0")
+    if args.max_samples < 0:
+        raise ValueError("--max_samples must be >= 0")
     if args.disable_thinking:
         args.enable_thinking = False
 
@@ -350,6 +356,7 @@ def generate_batch_hf(
     temperature: float,
     top_p: float,
     top_k: int,
+    min_p: float,
 ) -> List[str]:
     enc = tokenizer(
         prompt_texts,
@@ -361,16 +368,21 @@ def generate_batch_hf(
     )
     enc = {k: v.to(model.device) for k, v in enc.items()}
 
-    out = model.generate(
+    gen_kwargs: Dict[str, Any] = {
         **enc,
-        max_new_tokens=max_new_tokens,
-        do_sample=True,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
+        "max_new_tokens": max_new_tokens,
+        "do_sample": True,  # Never greedy for Qwen3 thinking-mode generation
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    # min_p is available in newer transformers generation APIs.
+    if "min_p" in inspect.signature(model.generate).parameters:
+        gen_kwargs["min_p"] = min_p
+
+    out = model.generate(**gen_kwargs)
     gen = out[:, enc["input_ids"].shape[1] :]
     return tokenizer.batch_decode(gen, skip_special_tokens=False)
 
@@ -382,6 +394,7 @@ def generate_batch_vllm(
     temperature: float,
     top_p: float,
     top_k: int,
+    min_p: float,
 ) -> List[str]:
     from vllm import SamplingParams
 
@@ -389,6 +402,7 @@ def generate_batch_vllm(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        min_p=min_p,
         max_tokens=max_new_tokens,
     )
     outputs = llm.generate(prompt_texts, sampling_params=sampling)
@@ -470,11 +484,6 @@ def main() -> None:
             "Use a single process when --use_vllm is enabled."
         )
 
-    local_max = local_target(args.max_samples, world=world, rank=rank)
-    if local_max <= 0:
-        print(f"Rank {rank}: nothing to do (local_max=0).")
-        return
-
     rng = random.Random(args.seed + rank)
 
     out_dir = args.out_dir
@@ -522,6 +531,17 @@ def main() -> None:
     if not examples:
         raise RuntimeError("No HotpotQA examples after filtering.")
 
+    if args.max_samples == 0:
+        local_max = len(examples)
+    else:
+        local_max = min(local_target(args.max_samples, world=world, rank=rank), len(examples))
+
+    if local_max <= 0:
+        print(f"Rank {rank}: nothing to do (local_max=0).")
+        return
+
+    examples = examples[:local_max]
+
     writer = ParquetShardWriter(
         out_dir=out_dir,
         shard_size=args.shard_size,
@@ -536,8 +556,6 @@ def main() -> None:
     produced = 0
     skipped_parse = 0
     skipped_empty = 0
-    ex_i = 0
-
     pbar = tqdm(
         total=local_max,
         desc=f"hotpot reasoning traces (rank {rank})",
@@ -560,6 +578,7 @@ def main() -> None:
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
+                min_p=args.min_p,
             )
         else:
             completions = generate_batch_hf(
@@ -571,6 +590,7 @@ def main() -> None:
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
+                min_p=args.min_p,
             )
 
         for ex, raw in zip(pending, completions):
@@ -578,6 +598,12 @@ def main() -> None:
                 break
             max_words = thinking_cap_for_version(ex["prompt_version"], args)
             thinking, answer = parse_reasoning_output(raw_text=raw, max_thinking_words=max_words)
+            if not answer:
+                # Fallback so we keep more rows from full train split.
+                answer = clean_content(raw)
+            if not thinking:
+                # Fallback compact thought when tags are missing.
+                thinking = truncate_words(clean_content(raw), max_words=max_words)
             if not answer:
                 skipped_empty += 1
                 continue
@@ -603,12 +629,9 @@ def main() -> None:
             out_buffer = []
 
     try:
-        while produced < local_max:
-            if ex_i >= len(examples):
-                ex_i = 0
-                rng.shuffle(examples)
-            ex = examples[ex_i]
-            ex_i += 1
+        for ex in examples:
+            if produced >= local_max:
+                break
 
             version = pick_prompt_version(args.prompt_version, rng=rng)
             system_prompt = system_prompt_for_version(version, idk_text=args.idk_text)
