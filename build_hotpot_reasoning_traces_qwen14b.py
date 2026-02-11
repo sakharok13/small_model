@@ -33,6 +33,8 @@ from synth_utils import ParquetShardWriter, with_rank_suffix_dir
 SPECIAL_TOKEN_RE = re.compile(r"<\|[^>]+?\|>")
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
+ANSWER_MARKER_RE = re.compile(r"(?:^|\n)\s*(?:final\s+answer|answer)\s*[:\-]\s*(.+)", re.IGNORECASE | re.DOTALL)
+ANSWER_OPEN_TAG_RE = re.compile(r"<answer>\s*(.*)$", re.IGNORECASE | re.DOTALL)
 
 IDK_DEFAULT = "I can't find the answer in the context."
 
@@ -120,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--disable_thinking", action="store_true")
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--max_prompt_tokens", type=int, default=2048)
-    ap.add_argument("--max_new_tokens", type=int, default=256)
+    ap.add_argument("--max_new_tokens", type=int, default=4096)
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top_p", type=float, default=None)
     ap.add_argument("--top_k", type=int, default=None)
@@ -453,28 +455,69 @@ def truncate_words(text: str, max_words: int) -> str:
     return " ".join(toks[:max_words]).strip()
 
 
+def linewise_tail(text: str) -> str:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def normalize_answer_text(answer: str) -> str:
+    answer = clean_content(answer)
+    if not answer:
+        return ""
+    # Keep only the final line when model spills multi-line thoughts into answer.
+    answer = linewise_tail(answer) or answer
+    answer = answer.strip(" \t\n\r\"'`")
+    if re.match(r"^(facts|bridge|check)\s*:", answer, flags=re.IGNORECASE):
+        return ""
+    return answer
+
+
 def parse_reasoning_output(raw_text: str, max_thinking_words: int) -> Tuple[str, str]:
-    text = raw_text.strip()
+    text = SPECIAL_TOKEN_RE.sub(" ", raw_text).replace("<s>", " ").replace("</s>", " ").strip()
     think_match = THINK_RE.search(text)
     answer_match = ANSWER_RE.search(text)
 
     thinking = think_match.group(1).strip() if think_match else ""
     answer = answer_match.group(1).strip() if answer_match else ""
 
-    if not answer:
-        if think_match:
-            answer = text[think_match.end() :].strip()
+    if not answer and think_match:
+        tail = text[think_match.end() :].strip()
+        open_tag = ANSWER_OPEN_TAG_RE.search(tail)
+        if open_tag:
+            answer = open_tag.group(1).strip()
         else:
-            answer = text.strip()
+            marker = ANSWER_MARKER_RE.search(tail)
+            if marker:
+                answer = marker.group(1).strip()
+            else:
+                answer = linewise_tail(tail)
 
     if not thinking and answer_match:
         prefix = text[: answer_match.start()].strip()
+        prefix = re.sub(r"<think>", " ", prefix, flags=re.IGNORECASE)
         prefix = clean_content(prefix)
         if prefix:
             thinking = prefix
 
+    if not answer and not answer_match:
+        marker = ANSWER_MARKER_RE.search(text)
+        if marker:
+            answer = marker.group(1).strip()
+            if not thinking:
+                prefix = text[: marker.start()].strip()
+                thinking = clean_content(prefix)
+        else:
+            # Last-resort split: use last non-empty line as answer.
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if lines:
+                answer = lines[-1]
+                if not thinking and len(lines) > 1:
+                    thinking = " ".join(lines[:-1])
+
     thinking = clean_content(thinking)
-    answer = clean_content(answer)
+    answer = normalize_answer_text(answer)
+    if thinking and answer and thinking.lower() == answer.lower():
+        answer = ""
     thinking = truncate_words(thinking, max_words=max_thinking_words)
     return thinking, answer
 
@@ -626,14 +669,14 @@ def main() -> None:
             max_words = thinking_cap_for_version(ex["prompt_version"], args)
             thinking, answer = parse_reasoning_output(raw_text=raw, max_thinking_words=max_words)
             if not answer:
-                # Fallback so we keep more rows from full train split.
-                answer = clean_content(raw)
-            if not thinking:
-                # Fallback compact thought when tags are missing.
-                thinking = truncate_words(clean_content(raw), max_words=max_words)
-            if not answer:
                 skipped_empty += 1
                 continue
+            if not thinking:
+                # Keep parser strict: do not inject full raw response into "thinking".
+                # We either allow empty thinking or skip this row as malformed.
+                if not args.allow_empty_thinking:
+                    skipped_parse += 1
+                    continue
             if (not args.allow_empty_thinking) and (not thinking):
                 skipped_parse += 1
                 continue
