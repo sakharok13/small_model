@@ -123,23 +123,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.90)
     ap.add_argument("--vllm_max_model_len", type=int, default=8192)
     ap.add_argument("--vllm_dtype", type=str, default="auto")
-    vllm_eager_group = ap.add_mutually_exclusive_group()
-    vllm_eager_group.add_argument("--vllm_enforce_eager", dest="vllm_enforce_eager", action="store_true")
-    vllm_eager_group.add_argument("--vllm_no_enforce_eager", dest="vllm_enforce_eager", action="store_false")
-    ap.set_defaults(vllm_enforce_eager=True)
-    vllm_sanitize_group = ap.add_mutually_exclusive_group()
-    vllm_sanitize_group.add_argument(
-        "--vllm_sanitize_dist_env",
-        dest="vllm_sanitize_dist_env",
-        action="store_true",
-        help="Unset torch.distributed env vars before creating each vLLM instance.",
-    )
-    vllm_sanitize_group.add_argument(
-        "--vllm_no_sanitize_dist_env",
-        dest="vllm_sanitize_dist_env",
-        action="store_false",
-    )
-    ap.set_defaults(vllm_sanitize_dist_env=True)
     ap.add_argument(
         "--distributed_output_mode",
         type=str,
@@ -486,14 +469,6 @@ def thinking_cap_for_version(version: str, args: argparse.Namespace) -> int:
     return args.max_thinking_words
 
 
-def env_distributed_info() -> Tuple[int, int, int, bool]:
-    world = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    is_local_main = local_rank == 0
-    return world, rank, local_rank, is_local_main
-
-
 def pin_vllm_to_single_gpu(local_rank: int) -> str:
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     if not visible:
@@ -510,64 +485,30 @@ def pin_vllm_to_single_gpu(local_rank: int) -> str:
     return gpu
 
 
-def sanitize_dist_env_for_vllm() -> None:
-    # accelerate/torchrun env leaks into vLLM worker subprocesses and can cause hangs.
-    keys = [
-        "RANK",
-        "WORLD_SIZE",
-        "LOCAL_RANK",
-        "LOCAL_WORLD_SIZE",
-        "GROUP_RANK",
-        "ROLE_RANK",
-        "ROLE_WORLD_SIZE",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-        "TORCHELASTIC_RUN_ID",
-        "TORCHELASTIC_ERROR_FILE",
-        "TORCHELASTIC_RESTART_COUNT",
-        "TORCHELASTIC_MAX_RESTARTS",
-    ]
-    for key in keys:
-        os.environ.pop(key, None)
-    # Let each vLLM process choose its own local init endpoint.
-    os.environ.pop("MASTER_ADDR", None)
-    os.environ.pop("MASTER_PORT", None)
-
-
 def main() -> None:
     args = parse_args()
 
-    accelerator = None
-    if args.use_vllm:
-        world, rank, local_rank, is_local_main = env_distributed_info()
-        if world > 1:
-            if args.vllm_tensor_parallel_size != 1:
-                raise ValueError(
-                    "When launching multiple processes with --use_vllm, "
-                    "--vllm_tensor_parallel_size must be 1."
-                )
-            os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-            os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
-            os.environ.setdefault("NCCL_SOCKET_FAMILY", "AF_INET")
-            os.environ.setdefault("GLOO_USE_IPV6", "0")
-            os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
-            os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
-            bound_gpu = pin_vllm_to_single_gpu(local_rank=local_rank)
-            if is_local_main:
-                print(
-                    f"[vLLM multi-proc] world={world} | this rank={rank} "
-                    f"local_rank={local_rank} on GPU {bound_gpu}"
-                )
-            if args.vllm_sanitize_dist_env:
-                sanitize_dist_env_for_vllm()
-    else:
-        from accelerate import Accelerator
+    from accelerate import Accelerator
 
-        accelerator = Accelerator()
-        world = accelerator.num_processes
-        rank = accelerator.process_index
-        local_rank = accelerator.local_process_index
-        is_local_main = accelerator.is_local_main_process
+    accelerator = Accelerator()
+    world = accelerator.num_processes
+    rank = accelerator.process_index
+    local_rank = accelerator.local_process_index
+    is_local_main = accelerator.is_local_main_process
+
+    if args.use_vllm and world > 1:
+        if args.vllm_tensor_parallel_size != 1:
+            raise ValueError(
+                "When launching multiple processes with --use_vllm, "
+                "--vllm_tensor_parallel_size must be 1."
+            )
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        bound_gpu = pin_vllm_to_single_gpu(local_rank=local_rank)
+        if is_local_main:
+            print(
+                f"[vLLM multi-proc] world={world} | this rank={rank} "
+                f"local_rank={local_rank} on GPU {bound_gpu}"
+            )
 
     rng = random.Random(args.seed + rank)
 
@@ -596,7 +537,6 @@ def main() -> None:
             gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             max_model_len=args.vllm_max_model_len,
             dtype=args.vllm_dtype,
-            enforce_eager=args.vllm_enforce_eager,
         )
     else:
         dtype: Any = "auto"
