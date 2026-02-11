@@ -82,6 +82,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dataset_config", type=str, default="distractor")
     ap.add_argument("--split", type=str, default="train")
     ap.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Manual dataset sharding for simple multi-process vLLM launch.",
+    )
+    ap.add_argument(
+        "--shard_index",
+        type=int,
+        default=0,
+        help="Manual shard index in [0, num_shards).",
+    )
+    ap.add_argument(
         "--max_samples",
         type=int,
         default=0,
@@ -133,6 +145,10 @@ def parse_args() -> argparse.Namespace:
     args = ap.parse_args()
     if args.max_samples < 0:
         raise ValueError("--max_samples must be >= 0")
+    if args.num_shards <= 0:
+        raise ValueError("--num_shards must be > 0")
+    if not (0 <= args.shard_index < args.num_shards):
+        raise ValueError("--shard_index must satisfy 0 <= shard_index < num_shards")
     if args.disable_thinking:
         args.enable_thinking = False
 
@@ -469,46 +485,32 @@ def thinking_cap_for_version(version: str, args: argparse.Namespace) -> int:
     return args.max_thinking_words
 
 
-def pin_vllm_to_single_gpu(local_rank: int) -> str:
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if not visible:
-        gpu = str(local_rank)
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu
-        return gpu
-
-    parts = [x.strip() for x in visible.split(",") if x.strip()]
-    if len(parts) <= 1:
-        return parts[0] if parts else "0"
-
-    gpu = parts[local_rank % len(parts)]
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu
-    return gpu
-
-
 def main() -> None:
     args = parse_args()
 
-    from accelerate import Accelerator
-
-    accelerator = Accelerator()
-    world = accelerator.num_processes
-    rank = accelerator.process_index
-    local_rank = accelerator.local_process_index
-    is_local_main = accelerator.is_local_main_process
-
-    if args.use_vllm and world > 1:
-        if args.vllm_tensor_parallel_size != 1:
+    accelerator = None
+    if args.use_vllm:
+        world = args.num_shards
+        rank = args.shard_index
+        local_rank = rank
+        is_local_main = rank == 0
+        if world > 1 and args.vllm_tensor_parallel_size != 1:
             raise ValueError(
                 "When launching multiple processes with --use_vllm, "
                 "--vllm_tensor_parallel_size must be 1."
             )
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        bound_gpu = pin_vllm_to_single_gpu(local_rank=local_rank)
         if is_local_main:
-            print(
-                f"[vLLM multi-proc] world={world} | this rank={rank} "
-                f"local_rank={local_rank} on GPU {bound_gpu}"
-            )
+            gpu_env = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+            print(f"[vLLM simple multi-proc] world={world} rank={rank} CUDA_VISIBLE_DEVICES={gpu_env}")
+    else:
+        from accelerate import Accelerator
+
+        accelerator = Accelerator()
+        world = accelerator.num_processes
+        rank = accelerator.process_index
+        local_rank = accelerator.local_process_index
+        is_local_main = accelerator.is_local_main_process
 
     rng = random.Random(args.seed + rank)
 
