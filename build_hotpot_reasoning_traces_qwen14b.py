@@ -53,7 +53,7 @@ PROMPT_V2_SHORT = (
     "1) Use only CONTEXT.\n"
     "2) Keep reasoning extremely short (max 20 words).\n"
     "3) Output exactly:\n"
-    "   <think>very short reasoning</think>\n"
+    "   <think>extremely short reasoning</think>\n"
     "   <answer>final answer</answer>\n"
     "4) If answer is not in context, output EXACTLY this in <answer>: {idk}\n"
 )
@@ -469,20 +469,59 @@ def thinking_cap_for_version(version: str, args: argparse.Namespace) -> int:
     return args.max_thinking_words
 
 
+def env_distributed_info() -> Tuple[int, int, int, bool]:
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_local_main = local_rank == 0
+    return world, rank, local_rank, is_local_main
+
+
+def pin_vllm_to_single_gpu(local_rank: int) -> str:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        gpu = str(local_rank)
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+        return gpu
+
+    parts = [x.strip() for x in visible.split(",") if x.strip()]
+    if len(parts) <= 1:
+        return parts[0] if parts else "0"
+
+    gpu = parts[local_rank % len(parts)]
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+    return gpu
+
+
 def main() -> None:
     args = parse_args()
 
-    from accelerate import Accelerator
+    accelerator = None
+    if args.use_vllm:
+        world, rank, local_rank, is_local_main = env_distributed_info()
+        if world > 1:
+            if args.vllm_tensor_parallel_size != 1:
+                raise ValueError(
+                    "When launching multiple processes with --use_vllm, "
+                    "--vllm_tensor_parallel_size must be 1."
+                )
+            os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+            os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
+            os.environ.setdefault("NCCL_SOCKET_FAMILY", "AF_INET")
+            bound_gpu = pin_vllm_to_single_gpu(local_rank=local_rank)
+            if is_local_main:
+                print(
+                    f"[vLLM multi-proc] world={world} | this rank={rank} "
+                    f"local_rank={local_rank} on GPU {bound_gpu}"
+                )
+    else:
+        from accelerate import Accelerator
 
-    accelerator = Accelerator()
-    world = accelerator.num_processes
-    rank = accelerator.process_index
-
-    if args.use_vllm and world > 1:
-        raise RuntimeError(
-            "vLLM already handles multi-GPU with tensor_parallel_size. "
-            "Use a single process when --use_vllm is enabled."
-        )
+        accelerator = Accelerator()
+        world = accelerator.num_processes
+        rank = accelerator.process_index
+        local_rank = accelerator.local_process_index
+        is_local_main = accelerator.is_local_main_process
 
     rng = random.Random(args.seed + rank)
 
@@ -521,7 +560,7 @@ def main() -> None:
             device_map=None if world > 1 else "auto",
             **model_kwargs,
         )
-        if world > 1:
+        if world > 1 and accelerator is not None:
             model.to(accelerator.device)
         model.eval()
 
@@ -560,7 +599,7 @@ def main() -> None:
         total=local_max,
         desc=f"hotpot reasoning traces (rank {rank})",
         unit="ex",
-        disable=not accelerator.is_local_main_process,
+        disable=not is_local_main,
     )
 
     def flush_pending() -> None:
