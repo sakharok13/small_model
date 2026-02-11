@@ -529,8 +529,9 @@ def sanitize_dist_env_for_vllm() -> None:
     ]
     for key in keys:
         os.environ.pop(key, None)
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29599")
+    # Let each vLLM process choose its own local init endpoint.
+    os.environ.pop("MASTER_ADDR", None)
+    os.environ.pop("MASTER_PORT", None)
 
 
 def main() -> None:
@@ -549,6 +550,8 @@ def main() -> None:
             os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
             os.environ.setdefault("NCCL_SOCKET_FAMILY", "AF_INET")
             os.environ.setdefault("GLOO_USE_IPV6", "0")
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+            os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
             bound_gpu = pin_vllm_to_single_gpu(local_rank=local_rank)
             if is_local_main:
                 print(
