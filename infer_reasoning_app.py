@@ -61,6 +61,43 @@ def _between(text: str, start: str, end: str) -> str:
     return text[i + len(start) : j].strip()
 
 
+def _strip_structure_tokens(text: str, args: argparse.Namespace) -> str:
+    for tok in (
+        args.thinking_start_token,
+        args.thinking_end_token,
+        args.answer_start_token,
+        args.answer_end_token,
+    ):
+        if tok:
+            text = text.replace(tok, " ")
+    return _clean_text(text)
+
+
+def _answer_from_answer_end_tail(raw: str, args: argparse.Namespace) -> str:
+    i_end = raw.rfind(args.answer_end_token)
+    if i_end < 0:
+        return ""
+    prefix = raw[:i_end]
+
+    # Canonical answer marker.
+    i_ans = prefix.rfind(args.answer_start_token)
+    if i_ans >= 0:
+        return prefix[i_ans + len(args.answer_start_token) :].strip()
+
+    # Common malformed case:
+    # [thinking_end][thinking_start]FINAL_ANSWER[answer_end]
+    i_think_end = prefix.rfind(args.thinking_end_token)
+    if i_think_end >= 0:
+        return prefix[i_think_end + len(args.thinking_end_token) :].strip()
+
+    # Last resort in malformed output.
+    i_think_start = prefix.rfind(args.thinking_start_token)
+    if i_think_start >= 0:
+        return prefix[i_think_start + len(args.thinking_start_token) :].strip()
+
+    return prefix.strip()
+
+
 def parse_generation(raw: str, args: argparse.Namespace) -> Tuple[str, str]:
     thinking = _between(raw, args.thinking_start_token, args.thinking_end_token)
     answer = _between(raw, args.answer_start_token, args.answer_end_token)
@@ -73,12 +110,16 @@ def parse_generation(raw: str, args: argparse.Namespace) -> Tuple[str, str]:
             thinking = raw[i_think + len(args.thinking_start_token) : i_ans].strip()
 
     if not answer:
+        # Recover malformed but common outputs that still terminate with [answer_end].
+        answer = _answer_from_answer_end_tail(raw, args)
+
+    if not answer:
         # Fallback when [answer_end] is missing.
         i_ans = raw.find(args.answer_start_token)
         if i_ans >= 0:
             answer = raw[i_ans + len(args.answer_start_token) :].strip()
 
-    return _clean_text(thinking), _clean_text(answer)
+    return _strip_structure_tokens(thinking, args), _strip_structure_tokens(answer, args)
 
 
 def load_model(
@@ -226,4 +267,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
