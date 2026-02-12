@@ -69,6 +69,8 @@ def parse_args(default_model_name: str) -> argparse.Namespace:
 
     ap.add_argument("--evaluation_strategy", type=str, default="steps", choices=["no", "steps", "epoch"])
     ap.add_argument("--eval_steps", type=int, default=500)
+    ap.add_argument("--ddp_backend", type=str, default="nccl")
+    ap.add_argument("--ddp_find_unused_parameters", action="store_true")
 
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--fp16", action="store_true")
@@ -271,6 +273,8 @@ def build_training_args(args: argparse.Namespace, eval_enabled: bool) -> Trainin
         "remove_unused_columns": False,
         "optim": "adamw_torch",
         "eval_steps": args.eval_steps,
+        "ddp_backend": args.ddp_backend,
+        "ddp_find_unused_parameters": args.ddp_find_unused_parameters,
     }
     if args.run_name:
         kwargs["run_name"] = args.run_name
@@ -405,4 +409,3 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
 
 if __name__ == "__main__":
     main()
-
