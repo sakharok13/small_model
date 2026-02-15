@@ -42,6 +42,7 @@ def build_prompt(query: str, context: str, args: argparse.Namespace) -> str:
     return (
         f"{args.context_start_token}{context}{args.context_end_token}"
         f"{args.query_start_token}{query}{args.query_end_token}"
+        f"{args.thinking_start_token}"
     )
 
 
@@ -103,7 +104,17 @@ def parse_generation(raw: str, args: argparse.Namespace) -> Tuple[str, str]:
     answer = _between(raw, args.answer_start_token, args.answer_end_token)
 
     if not thinking:
-        # Fallback when [thinking_end] is missing but [answer_start] exists.
+        # Prompt ends with [thinking_start], so generation may omit this token.
+        # Parse thinking as the prefix before [thinking_end] (or [answer_start] fallback).
+        i_think_end = raw.find(args.thinking_end_token)
+        i_ans = raw.find(args.answer_start_token)
+        if i_think_end >= 0:
+            thinking = raw[:i_think_end].strip()
+        elif i_ans > 0:
+            thinking = raw[:i_ans].strip()
+
+    if not thinking:
+        # Additional fallback when explicit [thinking_start] is generated.
         i_think = raw.find(args.thinking_start_token)
         i_ans = raw.find(args.answer_start_token)
         if i_think >= 0 and i_ans > i_think:
@@ -236,7 +247,8 @@ def main() -> None:
         gr.Markdown(
             "Prompt format: "
             f"`{args.context_start_token}context{args.context_end_token}` + "
-            f"`{args.query_start_token}query{args.query_end_token}`"
+            f"`{args.query_start_token}query{args.query_end_token}` + "
+            f"`{args.thinking_start_token}`"
         )
 
         with gr.Row():

@@ -72,6 +72,8 @@ PROMPT_V3_STRUCTURED = (
     "If answer is not in context, output EXACTLY this in <answer>: {idk}\n"
 )
 
+ALL_VERSIONS: Tuple[str, str, str] = ("v1", "v2", "v3")
+
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
@@ -109,14 +111,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--prompt_version",
         type=str,
-        choices=["v1", "v2", "v3", "mix"],
+        choices=["v1", "v2", "v3", "mix", "all"],
         default="mix",
-        help="v1=basic, v2=very short thinking, v3=structured thinking, mix=random among all three",
+        help="v1/v2/v3=single version, mix=random single version per example, all=generate all three versions per example",
     )
     ap.add_argument("--idk_text", type=str, default=IDK_DEFAULT)
     ap.add_argument("--max_thinking_words", type=int, default=80)
     ap.add_argument("--max_thinking_words_v2", type=int, default=20)
     ap.add_argument("--allow_empty_thinking", action="store_true")
+    ap.add_argument(
+        "--fallback_to_reference_answer",
+        action="store_true",
+        help="If parsing fails to extract <answer>, use reference_answer instead of dropping the row.",
+    )
 
     ap.add_argument("--enable_thinking", action="store_true", default=True)
     ap.add_argument("--disable_thinking", action="store_true")
@@ -333,10 +340,12 @@ def system_prompt_for_version(version: str, idk_text: str) -> str:
     raise ValueError(f"Unknown prompt version: {version}")
 
 
-def pick_prompt_version(configured: str, rng: random.Random) -> str:
-    if configured != "mix":
-        return configured
-    return rng.choice(["v1", "v2", "v3"])
+def pick_prompt_versions(configured: str, rng: random.Random) -> List[str]:
+    if configured == "all":
+        return list(ALL_VERSIONS)
+    if configured == "mix":
+        return [rng.choice(list(ALL_VERSIONS))]
+    return [configured]
 
 
 def build_prompt_text(
@@ -611,6 +620,8 @@ def main() -> None:
         return
 
     examples = examples[:local_max]
+    rows_per_example = 3 if args.prompt_version == "all" else 1
+    target_rows = local_max * rows_per_example
 
     writer = ParquetShardWriter(
         out_dir=out_dir,
@@ -626,16 +637,17 @@ def main() -> None:
     produced = 0
     skipped_parse = 0
     skipped_empty = 0
+    fallback_reference_answer = 0
     pbar = tqdm(
-        total=local_max,
+        total=target_rows,
         desc=f"hotpot reasoning traces (rank {rank})",
         unit="ex",
         disable=not is_local_main,
     )
 
     def flush_pending() -> None:
-        nonlocal pending, out_buffer, produced, skipped_parse, skipped_empty
-        if not pending or produced >= local_max:
+        nonlocal pending, out_buffer, produced, skipped_parse, skipped_empty, fallback_reference_answer
+        if not pending or produced >= target_rows:
             pending = []
             return
 
@@ -664,22 +676,23 @@ def main() -> None:
             )
 
         for ex, raw in zip(pending, completions):
-            if produced >= local_max:
+            if produced >= target_rows:
                 break
             max_words = thinking_cap_for_version(ex["prompt_version"], args)
             thinking, answer = parse_reasoning_output(raw_text=raw, max_thinking_words=max_words)
             if not answer:
-                skipped_empty += 1
-                continue
+                if args.fallback_to_reference_answer and ex["reference_answer"]:
+                    answer = str(ex["reference_answer"]).strip()
+                    fallback_reference_answer += 1
+                else:
+                    skipped_empty += 1
+                    continue
             if not thinking:
                 # Keep parser strict: do not inject full raw response into "thinking".
                 # We either allow empty thinking or skip this row as malformed.
                 if not args.allow_empty_thinking:
                     skipped_parse += 1
                     continue
-            if (not args.allow_empty_thinking) and (not thinking):
-                skipped_parse += 1
-                continue
 
             row = {
                 "query": ex["query"],
@@ -700,33 +713,36 @@ def main() -> None:
 
     try:
         for ex in examples:
-            if produced >= local_max:
+            if produced >= target_rows:
                 break
 
-            version = pick_prompt_version(args.prompt_version, rng=rng)
-            system_prompt = system_prompt_for_version(version, idk_text=args.idk_text)
-            prompt_text = build_prompt_text(
-                tokenizer=tokenizer,
-                query=ex["query"],
-                context=ex["context"],
-                system_prompt=system_prompt,
-                enable_thinking=args.enable_thinking,
-            )
+            versions = pick_prompt_versions(args.prompt_version, rng=rng)
+            for version in versions:
+                if produced >= target_rows:
+                    break
+                system_prompt = system_prompt_for_version(version, idk_text=args.idk_text)
+                prompt_text = build_prompt_text(
+                    tokenizer=tokenizer,
+                    query=ex["query"],
+                    context=ex["context"],
+                    system_prompt=system_prompt,
+                    enable_thinking=args.enable_thinking,
+                )
 
-            pending.append(
-                {
-                    "query": ex["query"],
-                    "context": ex["context"],
-                    "reference_answer": ex["reference_answer"],
-                    "prompt_version": version,
-                    "prompt_text": prompt_text,
-                }
-            )
+                pending.append(
+                    {
+                        "query": ex["query"],
+                        "context": ex["context"],
+                        "reference_answer": ex["reference_answer"],
+                        "prompt_version": version,
+                        "prompt_text": prompt_text,
+                    }
+                )
 
-            if len(pending) >= args.batch_size:
-                flush_pending()
-                pbar.n = produced
-                pbar.refresh()
+                if len(pending) >= args.batch_size:
+                    flush_pending()
+                    pbar.n = produced
+                    pbar.refresh()
     finally:
         flush_pending()
         if out_buffer:
@@ -739,12 +755,14 @@ def main() -> None:
 
     stats = {
         "global_max_samples": args.max_samples,
-        "local_target": local_max,
+        "local_examples_target": local_max,
+        "target_rows": target_rows,
         "produced_total": produced,
         "prompt_version_config": args.prompt_version,
         "produced_by_prompt_version": version_counts,
         "skipped_parse": skipped_parse,
         "skipped_empty_answer": skipped_empty,
+        "fallback_reference_answer_used": fallback_reference_answer,
         "rank": rank,
         "world": world,
         "args": vars(args),
