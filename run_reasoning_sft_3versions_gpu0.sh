@@ -19,7 +19,7 @@ DATA_DIR="${DATA_DIR:-/home/jovyan/gambashidze/data}"
 TRAIN_FILES="${TRAIN_FILES:-${DATA_DIR}/hotpot_traces_all3.rank*}"
 RUNS_DIR="${RUNS_DIR:-${DATA_DIR}/../runs/reasoning_sft}"
 
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-3072}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-8072}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUM="${GRAD_ACCUM:-16}"
 LR="${LR:-2e-5}"
