@@ -97,10 +97,10 @@ def expand_paths(patterns: Sequence[str]) -> List[str]:
             for m in matches:
                 if os.path.isdir(m):
                     out.extend(glob(os.path.join(m, "*.parquet")))
-                else:
+                elif m.endswith(".parquet"):
                     out.append(m)
             continue
-        if os.path.isfile(pat):
+        if os.path.isfile(pat) and pat.endswith(".parquet"):
             out.append(pat)
     return sorted(set(out))
 
