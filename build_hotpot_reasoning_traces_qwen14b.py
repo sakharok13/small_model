@@ -129,7 +129,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--disable_thinking", action="store_true")
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--max_prompt_tokens", type=int, default=2048)
-    ap.add_argument("--max_new_tokens", type=int, default=4096)
+    ap.add_argument("--max_new_tokens", type=int, default=8192)
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top_p", type=float, default=None)
     ap.add_argument("--top_k", type=int, default=None)
