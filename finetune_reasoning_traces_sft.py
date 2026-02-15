@@ -6,7 +6,7 @@ import inspect
 import json
 import os
 from glob import glob
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from datasets import Dataset, load_dataset
@@ -22,6 +22,12 @@ def parse_args(default_model_name: str) -> argparse.Namespace:
 
     ap.add_argument("--train_files", action="append", default=[], help="Parquet file/dir/glob. Repeatable.")
     ap.add_argument("--eval_files", action="append", default=[], help="Optional parquet file/dir/glob for eval.")
+    ap.add_argument(
+        "--prompt_versions",
+        type=str,
+        default="",
+        help="Optional comma-separated prompt_version values to keep (e.g. v1 or v1,v2,v3).",
+    )
     ap.add_argument("--eval_ratio", type=float, default=0.01, help="Used only when --eval_files is empty.")
     ap.add_argument("--max_train_samples", type=int, default=0)
     ap.add_argument("--max_eval_samples", type=int, default=0)
@@ -88,7 +94,11 @@ def expand_paths(patterns: Sequence[str]) -> List[str]:
             continue
         matches = glob(pat)
         if matches:
-            out.extend(matches)
+            for m in matches:
+                if os.path.isdir(m):
+                    out.extend(glob(os.path.join(m, "*.parquet")))
+                else:
+                    out.append(m)
             continue
         if os.path.isfile(pat):
             out.append(pat)
@@ -145,6 +155,34 @@ def maybe_cap(ds: Dataset, n: int, seed: int) -> Dataset:
     if n <= 0 or len(ds) <= n:
         return ds
     return ds.shuffle(seed=seed).select(range(n))
+
+
+def parse_prompt_versions(spec: str) -> Set[str]:
+    return {x.strip() for x in str(spec or "").split(",") if x.strip()}
+
+
+def filter_prompt_versions(ds: Dataset, allowed: Set[str], split_name: str) -> Tuple[Dataset, Dict[str, Any]]:
+    stats: Dict[str, Any] = {
+        "split_name": split_name,
+        "allowed": sorted(allowed),
+        "before": len(ds),
+        "after": len(ds),
+    }
+    if not allowed:
+        stats["enabled"] = False
+        return ds, stats
+    stats["enabled"] = True
+    if "prompt_version" not in ds.column_names:
+        raise ValueError(
+            f"{split_name} is missing required column 'prompt_version' but --prompt_versions was set."
+        )
+
+    ds = ds.filter(
+        lambda ex: str_clean(ex.get("prompt_version")) in allowed,
+        desc=f"Filter prompt_version in {sorted(allowed)} ({split_name})",
+    )
+    stats["after"] = len(ds)
+    return ds, stats
 
 
 def build_prefix(ex: Dict[str, Any], args: argparse.Namespace) -> str:
@@ -301,6 +339,7 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
     train_paths = expand_paths(args.train_files)
     if not train_paths:
         raise ValueError("No train parquet files found. Pass --train_files file/dir/glob.")
+    allowed_prompt_versions = parse_prompt_versions(args.prompt_versions)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -316,6 +355,11 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
         print(f"Added special tokens: {added}")
 
     train_ds = load_parquet(train_paths, name="train")
+    train_ds, train_pv_stats = filter_prompt_versions(
+        train_ds,
+        allowed=allowed_prompt_versions,
+        split_name="train",
+    )
     train_ds, train_stats = filter_quality(
         train_ds,
         require_thinking=args.require_thinking,
@@ -327,11 +371,17 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
     eval_paths = expand_paths(args.eval_files)
     if eval_paths:
         eval_ds = load_parquet(eval_paths, name="eval")
+        eval_ds, eval_pv_stats = filter_prompt_versions(
+            eval_ds,
+            allowed=allowed_prompt_versions,
+            split_name="eval",
+        )
         eval_ds, eval_stats = filter_quality(
             eval_ds,
             require_thinking=args.require_thinking,
             filter_correct_only=args.filter_correct_only,
         )
+        eval_stats["prompt_version_filter"] = eval_pv_stats
     elif args.eval_ratio > 0.0 and len(train_ds) > 1:
         shuffled = train_ds.shuffle(seed=args.seed)
         eval_n = max(1, int(len(shuffled) * args.eval_ratio))
@@ -397,6 +447,8 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
         "eval_files_count": len(eval_paths),
         "train_rows": len(train_ds),
         "eval_rows": len(eval_ds) if eval_ds is not None else 0,
+        "prompt_versions_filter": sorted(allowed_prompt_versions),
+        "train_prompt_version_filter": train_pv_stats,
         "train_filter_stats": train_stats,
         "eval_filter_stats": eval_stats,
         "loss_masking": "labels are computed only for tokens after prefix; supervised segment starts at [thinking_start]",
