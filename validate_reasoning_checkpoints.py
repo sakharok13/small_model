@@ -581,7 +581,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max_missing_required_keys_rate", type=float, default=0.0)
 
     ap.add_argument("--no_fail_on_metadata", action="store_true")
-    ap.add_argument("--no_fail_on_missing_tokens", action="store_true")
+    ap.add_argument(
+        "--no_fail_on_missing_tokens",
+        action="store_true",
+        default=True,
+        help="Don't fail when bracket tokens are not registered as special tokens "
+             "(default: True, since bracket strings tokenize into existing subwords).",
+    )
     ap.add_argument("--no_fail_on_format", action="store_true")
     ap.add_argument("--dry_run", action="store_true")
     return ap.parse_args()

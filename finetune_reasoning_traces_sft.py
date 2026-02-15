@@ -56,7 +56,12 @@ def parse_args(default_model_name: str) -> argparse.Namespace:
     ap.add_argument("--thinking_end_token", type=str, default="[thinking_end]")
     ap.add_argument("--answer_start_token", type=str, default="[answer_start]")
     ap.add_argument("--answer_end_token", type=str, default="[answer_end]")
-    ap.add_argument("--no_register_special_tokens", action="store_true")
+    ap.add_argument(
+        "--register_special_tokens",
+        action="store_true",
+        help="Add bracket tokens as new special tokens (new embeddings). "
+             "Off by default: bracket strings tokenize into existing subwords.",
+    )
 
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
     ap.add_argument("--per_device_eval_batch_size", type=int, default=1)
@@ -291,6 +296,7 @@ def build_training_args(args: argparse.Namespace, eval_enabled: bool) -> Trainin
     allowed = set(sig.parameters.keys())
     eval_strategy_value = args.evaluation_strategy if eval_enabled else "no"
 
+    is_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     kwargs: Dict[str, Any] = {
         "output_dir": args.output_dir,
         "per_device_train_batch_size": args.per_device_train_batch_size,
@@ -311,9 +317,10 @@ def build_training_args(args: argparse.Namespace, eval_enabled: bool) -> Trainin
         "remove_unused_columns": False,
         "optim": "adamw_torch",
         "eval_steps": args.eval_steps,
-        "ddp_backend": args.ddp_backend,
-        "ddp_find_unused_parameters": args.ddp_find_unused_parameters,
     }
+    if is_distributed:
+        kwargs["ddp_backend"] = args.ddp_backend
+        kwargs["ddp_find_unused_parameters"] = args.ddp_find_unused_parameters
     if args.run_name:
         kwargs["run_name"] = args.run_name
     if args.logging_dir:
@@ -350,7 +357,7 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    if not args.no_register_special_tokens:
+    if args.register_special_tokens:
         added = register_special_tokens(tokenizer, args)
         print(f"Added special tokens: {added}")
 
@@ -423,7 +430,7 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
         model.gradient_checkpointing_enable()
         if hasattr(model, "config"):
             model.config.use_cache = False
-    if not args.no_register_special_tokens:
+    if args.register_special_tokens:
         model.resize_token_embeddings(len(tokenizer))
 
     collator = ThinkingStartCollator(tokenizer=tokenizer, max_length=args.max_seq_len, args=args)
