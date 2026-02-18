@@ -230,6 +230,7 @@ def build_training_args(args: argparse.Namespace, eval_enabled: bool) -> Trainin
     allowed = set(sig.parameters.keys())
     eval_strategy_value = args.evaluation_strategy if eval_enabled else "no"
 
+    is_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     kwargs: Dict[str, Any] = {
         "output_dir": args.output_dir,
         "per_device_train_batch_size": args.per_device_train_batch_size,
@@ -250,9 +251,10 @@ def build_training_args(args: argparse.Namespace, eval_enabled: bool) -> Trainin
         "remove_unused_columns": False,
         "optim": "adamw_torch",
         "eval_steps": args.eval_steps,
-        "ddp_backend": args.ddp_backend,
-        "ddp_find_unused_parameters": args.ddp_find_unused_parameters,
     }
+    if is_distributed:
+        kwargs["ddp_backend"] = args.ddp_backend
+        kwargs["ddp_find_unused_parameters"] = args.ddp_find_unused_parameters
     if args.run_name:
         kwargs["run_name"] = args.run_name
     if args.logging_dir:
@@ -466,23 +468,40 @@ def main() -> None:
         args.model_name,
         **build_model_kwargs(args=args, dtype=dtype),
     )
+    # Keep model/generation token ids aligned with tokenizer to avoid runtime auto-alignment warnings.
+    if hasattr(model, "config"):
+        model.config.pad_token_id = tokenizer.pad_token_id
+        model.config.bos_token_id = tokenizer.bos_token_id
+        model.config.eos_token_id = tokenizer.eos_token_id
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+        model.generation_config.bos_token_id = tokenizer.bos_token_id
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
+
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         if hasattr(model, "config"):
             model.config.use_cache = False
 
-    trainer = Trainer(
-        model=model,
-        args=build_training_args(args=args, eval_enabled=eval_ds is not None),
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        data_collator=collator,
-        tokenizer=tokenizer,
-    )
+    trainer_kwargs: Dict[str, Any] = {
+        "model": model,
+        "args": build_training_args(args=args, eval_enabled=eval_ds is not None),
+        "train_dataset": train_ds,
+        "eval_dataset": eval_ds,
+        "data_collator": collator,
+    }
+    trainer_sig = inspect.signature(Trainer.__init__)
+    if "processing_class" in trainer_sig.parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in trainer_sig.parameters:
+        trainer_kwargs["tokenizer"] = tokenizer
+    trainer = Trainer(**trainer_kwargs)
 
-    print(f"Train rows: {len(train_ds)}")
-    if eval_ds is not None:
-        print(f"Eval rows: {len(eval_ds)}")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if local_rank == 0:
+        print(f"Train rows: {len(train_ds)}")
+        if eval_ds is not None:
+            print(f"Eval rows: {len(eval_ds)}")
 
     trainer.train()
     trainer.save_model(args.output_dir)
@@ -505,7 +524,8 @@ def main() -> None:
     }
     with open(os.path.join(args.output_dir, "sft_hotpot_answer_summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if local_rank == 0:
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -14,12 +14,14 @@ Output parquet fields:
 """
 
 import argparse
+import hashlib
 import inspect
 import json
 import os
 import random
 import re
 from collections import defaultdict
+from glob import glob
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -138,6 +140,22 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--shard_size", type=int, default=50_000)
     ap.add_argument("--save_every", type=int, default=5_000)
     ap.add_argument("--parquet_compression", type=str, default="zstd")
+    ap.add_argument(
+        "--skip_existing",
+        dest="skip_existing",
+        action="store_true",
+        default=True,
+        help=(
+            "When output part-*.parquet files already exist, skip already-generated "
+            "tasks using (query, context, prompt_version, reference_answer) keys."
+        ),
+    )
+    ap.add_argument(
+        "--no_skip_existing",
+        dest="skip_existing",
+        action="store_false",
+        help="Disable resume/skip behavior and append everything.",
+    )
 
     ap.add_argument("--use_vllm", action="store_true")
     ap.add_argument("--vllm_tensor_parallel_size", type=int, default=1)
@@ -180,6 +198,70 @@ def local_target(global_max: int, world: int, rank: int) -> int:
     base = global_max // world
     rem = global_max % world
     return base + (1 if rank < rem else 0)
+
+
+def make_task_key(query: Any, context: Any, prompt_version: Any, reference_answer: Any) -> str:
+    h = hashlib.blake2b(digest_size=16)
+    for part in (query, context, prompt_version, reference_answer):
+        text = str("" if part is None else part)
+        h.update(text.encode("utf-8", errors="ignore"))
+        h.update(b"\x1f")
+    return h.hexdigest()
+
+
+def scan_existing_outputs(out_dir: str) -> Tuple[int, Set[str], Dict[str, int]]:
+    files = sorted(glob(os.path.join(out_dir, "part-*.parquet")))
+    if not files:
+        return 0, set(), {"v1": 0, "v2": 0, "v3": 0}
+    try:
+        import pyarrow.parquet as pq
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("pyarrow is required to scan existing parquet shards for resume.") from exc
+
+    total_rows_on_disk = 0
+    keys: Set[str] = set()
+    counts_by_version: Dict[str, int] = {"v1": 0, "v2": 0, "v3": 0}
+
+    for path in files:
+        pf = pq.ParquetFile(path)
+        total_rows_on_disk += pf.metadata.num_rows
+        names = set(pf.schema_arrow.names)
+        if "query" not in names or "context" not in names:
+            continue
+        read_cols = ["query", "context"]
+        if "prompt_version" in names:
+            read_cols.append("prompt_version")
+        if "reference_answer" in names:
+            read_cols.append("reference_answer")
+        table = pq.read_table(path, columns=read_cols)
+        data = table.to_pydict()
+
+        queries = data.get("query") or []
+        contexts = data.get("context") or []
+        n = min(len(queries), len(contexts))
+        prompt_versions = data.get("prompt_version")
+        if prompt_versions is None:
+            prompt_versions = [""] * n
+        reference_answers = data.get("reference_answer")
+        if reference_answers is None:
+            reference_answers = [""] * n
+
+        for i in range(n):
+            pv = prompt_versions[i] if i < len(prompt_versions) else ""
+            ra = reference_answers[i] if i < len(reference_answers) else ""
+            key = make_task_key(
+                query=queries[i],
+                context=contexts[i],
+                prompt_version=pv,
+                reference_answer=ra,
+            )
+            if key in keys:
+                continue
+            keys.add(key)
+            if pv in counts_by_version:
+                counts_by_version[pv] += 1
+
+    return total_rows_on_disk, keys, counts_by_version
 
 
 def parse_context_field(raw: Any) -> List[Tuple[str, List[str]]]:
@@ -537,6 +619,12 @@ def thinking_cap_for_version(version: str, args: argparse.Namespace) -> int:
     return args.max_thinking_words
 
 
+def write_stats(out_dir: str, stats: Dict[str, Any]) -> None:
+    with open(os.path.join(out_dir, "stats.json"), "w", encoding="utf-8") as fh:
+        json.dump(stats, fh, indent=2, ensure_ascii=False)
+    print(json.dumps(stats, indent=2, ensure_ascii=False))
+
+
 def main() -> None:
     args = parse_args()
 
@@ -544,7 +632,6 @@ def main() -> None:
     if args.use_vllm:
         world = args.num_shards
         rank = args.shard_index
-        local_rank = rank
         is_local_main = rank == 0
         if world > 1 and args.vllm_tensor_parallel_size != 1:
             raise ValueError(
@@ -561,7 +648,6 @@ def main() -> None:
         accelerator = Accelerator()
         world = accelerator.num_processes
         rank = accelerator.process_index
-        local_rank = accelerator.local_process_index
         is_local_main = accelerator.is_local_main_process
 
     rng = random.Random(args.seed + rank)
@@ -570,6 +656,62 @@ def main() -> None:
     if world > 1 and args.distributed_output_mode == "per_rank":
         out_dir = with_rank_suffix_dir(args.out_dir, rank)
     os.makedirs(out_dir, exist_ok=True)
+
+    examples = load_hotpot_examples(args=args, world=world, rank=rank)
+    rng.shuffle(examples)
+
+    if not examples:
+        raise RuntimeError("No HotpotQA examples after filtering.")
+
+    if args.max_samples == 0:
+        local_max = len(examples)
+    else:
+        local_max = min(local_target(args.max_samples, world=world, rank=rank), len(examples))
+
+    if local_max <= 0:
+        print(f"Rank {rank}: nothing to do (local_max=0).")
+        return
+
+    examples = examples[:local_max]
+    rows_per_example = 3 if args.prompt_version == "all" else 1
+    target_rows = local_max * rows_per_example
+
+    existing_rows_on_disk = 0
+    completed_keys: Set[str] = set()
+    existing_version_counts: Dict[str, int] = {"v1": 0, "v2": 0, "v3": 0}
+    if args.skip_existing:
+        existing_rows_on_disk, completed_keys, existing_version_counts = scan_existing_outputs(out_dir)
+        if is_local_main and existing_rows_on_disk > 0:
+            print(
+                f"Rank {rank}: found {existing_rows_on_disk} rows on disk, "
+                f"{len(completed_keys)} unique completed tasks. Resuming remaining work."
+            )
+
+    produced = min(len(completed_keys), target_rows)
+    initial_produced = produced
+    if produced >= target_rows:
+        stats = {
+            "global_max_samples": args.max_samples,
+            "local_examples_target": local_max,
+            "target_rows": target_rows,
+            "produced_total": produced,
+            "produced_new": 0,
+            "existing_rows_on_disk_at_start": existing_rows_on_disk,
+            "existing_unique_rows_at_start": initial_produced,
+            "completed_unique_rows": produced,
+            "prompt_version_config": args.prompt_version,
+            "produced_by_prompt_version": existing_version_counts,
+            "skipped_existing_task": 0,
+            "skipped_parse": 0,
+            "skipped_empty_answer": 0,
+            "fallback_reference_answer_used": 0,
+            "rank": rank,
+            "world": world,
+            "args": vars(args),
+        }
+        write_stats(out_dir, stats)
+        print(f"Done. Wrote Hotpot reasoning traces to {out_dir}")
+        return
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name,
@@ -604,25 +746,6 @@ def main() -> None:
             model.to(accelerator.device)
         model.eval()
 
-    examples = load_hotpot_examples(args=args, world=world, rank=rank)
-    rng.shuffle(examples)
-
-    if not examples:
-        raise RuntimeError("No HotpotQA examples after filtering.")
-
-    if args.max_samples == 0:
-        local_max = len(examples)
-    else:
-        local_max = min(local_target(args.max_samples, world=world, rank=rank), len(examples))
-
-    if local_max <= 0:
-        print(f"Rank {rank}: nothing to do (local_max=0).")
-        return
-
-    examples = examples[:local_max]
-    rows_per_example = 3 if args.prompt_version == "all" else 1
-    target_rows = local_max * rows_per_example
-
     writer = ParquetShardWriter(
         out_dir=out_dir,
         shard_size=args.shard_size,
@@ -632,21 +755,23 @@ def main() -> None:
     pending: List[Dict[str, Any]] = []
     out_buffer: List[Dict[str, Any]] = []
     buffer_flush_rows = args.save_every if args.save_every > 0 else args.shard_size
-    version_counts: Dict[str, int] = {"v1": 0, "v2": 0, "v3": 0}
+    version_counts: Dict[str, int] = dict(existing_version_counts)
 
-    produced = 0
     skipped_parse = 0
     skipped_empty = 0
     fallback_reference_answer = 0
+    skipped_existing = 0
     pbar = tqdm(
         total=target_rows,
         desc=f"hotpot reasoning traces (rank {rank})",
         unit="ex",
         disable=not is_local_main,
     )
+    pbar.n = produced
+    pbar.refresh()
 
     def flush_pending() -> None:
-        nonlocal pending, out_buffer, produced, skipped_parse, skipped_empty, fallback_reference_answer
+        nonlocal pending, out_buffer, produced, skipped_parse, skipped_empty, fallback_reference_answer, skipped_existing
         if not pending or produced >= target_rows:
             pending = []
             return
@@ -678,6 +803,9 @@ def main() -> None:
         for ex, raw in zip(pending, completions):
             if produced >= target_rows:
                 break
+            if ex["task_key"] in completed_keys:
+                skipped_existing += 1
+                continue
             max_words = thinking_cap_for_version(ex["prompt_version"], args)
             thinking, answer = parse_reasoning_output(raw_text=raw, max_thinking_words=max_words)
             if not answer:
@@ -703,6 +831,7 @@ def main() -> None:
                 "reference_answer": ex["reference_answer"],
             }
             out_buffer.append(row)
+            completed_keys.add(ex["task_key"])
             produced += 1
             version_counts[ex["prompt_version"]] = version_counts.get(ex["prompt_version"], 0) + 1
 
@@ -720,6 +849,15 @@ def main() -> None:
             for version in versions:
                 if produced >= target_rows:
                     break
+                task_key = make_task_key(
+                    query=ex["query"],
+                    context=ex["context"],
+                    prompt_version=version,
+                    reference_answer=ex["reference_answer"],
+                )
+                if task_key in completed_keys:
+                    skipped_existing += 1
+                    continue
                 system_prompt = system_prompt_for_version(version, idk_text=args.idk_text)
                 prompt_text = build_prompt_text(
                     tokenizer=tokenizer,
@@ -736,6 +874,7 @@ def main() -> None:
                         "reference_answer": ex["reference_answer"],
                         "prompt_version": version,
                         "prompt_text": prompt_text,
+                        "task_key": task_key,
                     }
                 )
 
@@ -758,8 +897,13 @@ def main() -> None:
         "local_examples_target": local_max,
         "target_rows": target_rows,
         "produced_total": produced,
+        "produced_new": max(0, produced - initial_produced),
+        "existing_rows_on_disk_at_start": existing_rows_on_disk,
+        "existing_unique_rows_at_start": initial_produced,
+        "completed_unique_rows": len(completed_keys),
         "prompt_version_config": args.prompt_version,
         "produced_by_prompt_version": version_counts,
+        "skipped_existing_task": skipped_existing,
         "skipped_parse": skipped_parse,
         "skipped_empty_answer": skipped_empty,
         "fallback_reference_answer_used": fallback_reference_answer,
@@ -767,10 +911,7 @@ def main() -> None:
         "world": world,
         "args": vars(args),
     }
-    with open(os.path.join(out_dir, "stats.json"), "w", encoding="utf-8") as fh:
-        json.dump(stats, fh, indent=2, ensure_ascii=False)
-
-    print(json.dumps(stats, indent=2, ensure_ascii=False))
+    write_stats(out_dir, stats)
     print(f"Done. Wrote Hotpot reasoning traces to {out_dir}")
 
 
