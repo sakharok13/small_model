@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resume-safe 8-GPU HotpotQA reasoning generation.
+# Global rebalance + 8-GPU resume for HotpotQA reasoning generation.
 #
-# It launches 8 independent rank processes (0..7), each bound to one GPU via
-# CUDA_VISIBLE_DEVICES. The Python script skips already-generated rows in each
-# rank output directory by default.
-#
-# Example:
-#   bash run_8gpu_hotpot_reasoning_resume.sh
-#
-# Optional overrides:
-#   OUT_DIR=/home/jovyan/gambashidze/small_model/data/hotpot_reasoning_qwen14b \
-#   MAX_SAMPLES=0 PROMPT_VERSION=mix BATCH_SIZE=8 \
-#   bash run_8gpu_hotpot_reasoning_resume.sh
+# Steps:
+# 1) Aggregate completed rows across all rank outputs.
+# 2) Compute globally missing tasks.
+# 3) Redistribute missing tasks evenly to workers.
+# 4) Launch workers on 8 GPUs and process only missing tasks.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY_SCRIPT="${PY_SCRIPT:-${SCRIPT_DIR}/build_hotpot_reasoning_traces_qwen14b.py}"
+PREP_SCRIPT="${PREP_SCRIPT:-${SCRIPT_DIR}/prepare_hotpot_reasoning_rebalance.py}"
 
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-14B}"
 OUT_DIR="${OUT_DIR:-/home/jovyan/gambashidze/small_model/data/hotpot_reasoning_qwen14b}"
+PLAN_DIR="${PLAN_DIR:-${OUT_DIR}.rebalance_plan}"
 
 NUM_SHARDS="${NUM_SHARDS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 GPU_OFFSET="${GPU_OFFSET:-0}"
 
 DATASET_NAME="${DATASET_NAME:-hotpot_qa}"
@@ -50,30 +47,84 @@ VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
 VLLM_DTYPE="${VLLM_DTYPE:-auto}"
 
+STARTUP_CHECK_SECS="${STARTUP_CHECK_SECS:-20}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 echo "PY_SCRIPT=${PY_SCRIPT}"
+echo "PREP_SCRIPT=${PREP_SCRIPT}"
 echo "OUT_DIR=${OUT_DIR}"
+echo "PLAN_DIR=${PLAN_DIR}"
 echo "MODEL_NAME=${MODEL_NAME}"
 echo "NUM_SHARDS=${NUM_SHARDS}"
+echo "NUM_WORKERS=${NUM_WORKERS}"
 echo "GPU_OFFSET=${GPU_OFFSET}"
 
-pids=()
-for rank in $(seq 0 $((NUM_SHARDS - 1))); do
-  gpu=$((GPU_OFFSET + rank))
-  log_path="${OUT_DIR}.rank${rank}.log"
+mkdir -p "${PLAN_DIR}"
 
-  echo "Launching rank=${rank} on GPU=${gpu} (log: ${log_path})"
-  CUDA_VISIBLE_DEVICES="${gpu}" \
+prep_log="${PLAN_DIR}/prepare.log"
+summary_json="${PLAN_DIR}/summary.json"
+
+echo "Preparing global rebalance plan..."
+if ! PYTHONUNBUFFERED=1 python3 "${PREP_SCRIPT}" \
+  --out_dir "${OUT_DIR}" \
+  --plan_dir "${PLAN_DIR}" \
+  --dataset_name "${DATASET_NAME}" \
+  --dataset_config "${DATASET_CONFIG}" \
+  --split "${SPLIT}" \
+  --num_shards "${NUM_SHARDS}" \
+  --num_workers "${NUM_WORKERS}" \
+  --max_samples "${MAX_SAMPLES}" \
+  --seed "${SEED}" \
+  --context_mode "${CONTEXT_MODE}" \
+  --max_context_chars "${MAX_CONTEXT_CHARS}" \
+  --prompt_version "${PROMPT_VERSION}" \
+  > "${prep_log}" 2>&1; then
+  echo "Plan preparation failed. Last log lines:"
+  tail -n 120 "${prep_log}" || true
+  exit 1
+fi
+
+cat "${prep_log}"
+
+if [[ ! -f "${summary_json}" ]]; then
+  echo "Missing summary file: ${summary_json}"
+  exit 1
+fi
+
+missing_total="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], "r", encoding="utf-8")).get("missing_total", 0))' "${summary_json}")"
+if [[ "${missing_total}" -eq 0 ]]; then
+  echo "No missing tasks. Nothing to run."
+  exit 0
+fi
+
+echo "Missing tasks to run: ${missing_total}"
+
+pids=()
+ranks=()
+logs=()
+
+for rank in $(seq 0 $((NUM_WORKERS - 1))); do
+  gpu=$((GPU_OFFSET + rank))
+  task_file="${PLAN_DIR}/tasks_rank${rank}.jsonl"
+  log_path="${PLAN_DIR}/worker_rank${rank}.log"
+
+  if [[ ! -s "${task_file}" ]]; then
+    echo "Skipping rank=${rank}: no assigned tasks (${task_file})"
+    continue
+  fi
+
+  echo "Launching rank=${rank} on GPU=${gpu} with tasks=${task_file}"
+  CUDA_VISIBLE_DEVICES="${gpu}" PYTHONUNBUFFERED=1 \
   python3 "${PY_SCRIPT}" \
     --use_vllm \
+    --tasks_jsonl "${task_file}" \
     --model_name "${MODEL_NAME}" \
     --out_dir "${OUT_DIR}" \
+    --num_shards "${NUM_WORKERS}" \
+    --shard_index "${rank}" \
     --dataset_name "${DATASET_NAME}" \
     --dataset_config "${DATASET_CONFIG}" \
     --split "${SPLIT}" \
-    --num_shards "${NUM_SHARDS}" \
-    --shard_index "${rank}" \
     --max_samples "${MAX_SAMPLES}" \
     --seed "${SEED}" \
     --context_mode "${CONTEXT_MODE}" \
@@ -97,18 +148,49 @@ for rank in $(seq 0 $((NUM_SHARDS - 1))); do
     > "${log_path}" 2>&1 &
 
   pids+=("$!")
+  ranks+=("${rank}")
+  logs+=("${log_path}")
 done
 
+if [[ "${#pids[@]}" -eq 0 ]]; then
+  echo "No workers launched (all task files empty)."
+  exit 0
+fi
+
+echo "Launched ${#pids[@]} workers. Checking startup in ${STARTUP_CHECK_SECS}s..."
+sleep "${STARTUP_CHECK_SECS}"
+
+startup_failed=0
+for i in "${!pids[@]}"; do
+  pid="${pids[$i]}"
+  rank="${ranks[$i]}"
+  log_path="${logs[$i]}"
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    startup_failed=1
+    echo "Rank ${rank} exited early. Last log lines:"
+    tail -n 120 "${log_path}" || true
+  fi
+done
+
+if [[ "${startup_failed}" -ne 0 ]]; then
+  echo "Startup failures detected. Logs are under ${PLAN_DIR}/worker_rank*.log"
+  exit 1
+fi
+
 rc=0
-for pid in "${pids[@]}"; do
+for i in "${!pids[@]}"; do
+  pid="${pids[$i]}"
+  rank="${ranks[$i]}"
   if ! wait "${pid}"; then
     rc=1
+    echo "Rank ${rank} failed. Last log lines:"
+    tail -n 120 "${logs[$i]}" || true
   fi
 done
 
 if [[ "${rc}" -ne 0 ]]; then
-  echo "One or more ranks failed. Check ${OUT_DIR}.rank*.log"
+  echo "One or more workers failed. See ${PLAN_DIR}/worker_rank*.log"
   exit "${rc}"
 fi
 
-echo "All ranks finished."
+echo "All workers finished."

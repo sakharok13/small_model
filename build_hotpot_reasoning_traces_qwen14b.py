@@ -88,6 +88,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dataset_config", type=str, default="distractor")
     ap.add_argument("--split", type=str, default="train")
     ap.add_argument(
+        "--tasks_jsonl",
+        type=str,
+        default="",
+        help=(
+            "Optional precomputed task file (JSONL). When set, dataset loading/sharding "
+            "is bypassed and each line must include query/context/reference_answer/prompt_version."
+        ),
+    )
+    ap.add_argument(
         "--num_shards",
         type=int,
         default=1,
@@ -398,6 +407,55 @@ def load_hotpot_examples(args: argparse.Namespace, world: int, rank: int) -> Lis
     return out
 
 
+def load_tasks_from_jsonl(path: str) -> List[Dict[str, str]]:
+    tasks: List[Dict[str, str]] = []
+    if not path:
+        return tasks
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"--tasks_jsonl file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON at {path}:{line_no}") from exc
+
+            query = str(row.get("query") or "").strip()
+            context = str(row.get("context") or "").strip()
+            reference_answer = str(row.get("reference_answer") or "").strip()
+            prompt_version = str(row.get("prompt_version") or "").strip()
+            if not query or not context:
+                continue
+            if prompt_version not in ALL_VERSIONS:
+                raise ValueError(
+                    f"Invalid prompt_version='{prompt_version}' at {path}:{line_no}; "
+                    f"expected one of {list(ALL_VERSIONS)}"
+                )
+            task_key = str(row.get("task_key") or "").strip()
+            if not task_key:
+                task_key = make_task_key(
+                    query=query,
+                    context=context,
+                    prompt_version=prompt_version,
+                    reference_answer=reference_answer,
+                )
+
+            tasks.append(
+                {
+                    "query": query,
+                    "context": context,
+                    "reference_answer": reference_answer,
+                    "prompt_version": prompt_version,
+                    "task_key": task_key,
+                }
+            )
+    return tasks
+
+
 def build_model_kwargs(args: argparse.Namespace, dtype: Any) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
         "trust_remote_code": args.trust_remote_code,
@@ -657,24 +715,38 @@ def main() -> None:
         out_dir = with_rank_suffix_dir(args.out_dir, rank)
     os.makedirs(out_dir, exist_ok=True)
 
-    examples = load_hotpot_examples(args=args, world=world, rank=rank)
-    rng.shuffle(examples)
-
-    if not examples:
-        raise RuntimeError("No HotpotQA examples after filtering.")
-
-    if args.max_samples == 0:
-        local_max = len(examples)
+    task_mode = bool(args.tasks_jsonl)
+    examples: List[Dict[str, Any]] = []
+    assigned_tasks: List[Dict[str, str]] = []
+    if task_mode:
+        assigned_tasks = load_tasks_from_jsonl(args.tasks_jsonl)
+        target_rows = len(assigned_tasks)
+        local_max = target_rows
+        if is_local_main:
+            print(f"Rank {rank}: loaded {target_rows} preassigned tasks from {args.tasks_jsonl}")
     else:
-        local_max = min(local_target(args.max_samples, world=world, rank=rank), len(examples))
+        examples = load_hotpot_examples(args=args, world=world, rank=rank)
+        rng.shuffle(examples)
 
-    if local_max <= 0:
-        print(f"Rank {rank}: nothing to do (local_max=0).")
+        if not examples:
+            raise RuntimeError("No HotpotQA examples after filtering.")
+
+        if args.max_samples == 0:
+            local_max = len(examples)
+        else:
+            local_max = min(local_target(args.max_samples, world=world, rank=rank), len(examples))
+
+        if local_max <= 0:
+            print(f"Rank {rank}: nothing to do (local_max=0).")
+            return
+
+        examples = examples[:local_max]
+        rows_per_example = 3 if args.prompt_version == "all" else 1
+        target_rows = local_max * rows_per_example
+
+    if target_rows <= 0:
+        print(f"Rank {rank}: nothing to do (target_rows=0).")
         return
-
-    examples = examples[:local_max]
-    rows_per_example = 3 if args.prompt_version == "all" else 1
-    target_rows = local_max * rows_per_example
 
     existing_rows_on_disk = 0
     completed_keys: Set[str] = set()
@@ -691,6 +763,8 @@ def main() -> None:
     initial_produced = produced
     if produced >= target_rows:
         stats = {
+            "task_mode": task_mode,
+            "tasks_jsonl": args.tasks_jsonl if task_mode else "",
             "global_max_samples": args.max_samples,
             "local_examples_target": local_max,
             "target_rows": target_rows,
@@ -841,37 +915,30 @@ def main() -> None:
             out_buffer = []
 
     try:
-        for ex in examples:
-            if produced >= target_rows:
-                break
-
-            versions = pick_prompt_versions(args.prompt_version, rng=rng)
-            for version in versions:
+        if task_mode:
+            for task in assigned_tasks:
                 if produced >= target_rows:
                     break
-                task_key = make_task_key(
-                    query=ex["query"],
-                    context=ex["context"],
-                    prompt_version=version,
-                    reference_answer=ex["reference_answer"],
-                )
+                task_key = task["task_key"]
                 if task_key in completed_keys:
                     skipped_existing += 1
                     continue
+
+                version = task["prompt_version"]
                 system_prompt = system_prompt_for_version(version, idk_text=args.idk_text)
                 prompt_text = build_prompt_text(
                     tokenizer=tokenizer,
-                    query=ex["query"],
-                    context=ex["context"],
+                    query=task["query"],
+                    context=task["context"],
                     system_prompt=system_prompt,
                     enable_thinking=args.enable_thinking,
                 )
 
                 pending.append(
                     {
-                        "query": ex["query"],
-                        "context": ex["context"],
-                        "reference_answer": ex["reference_answer"],
+                        "query": task["query"],
+                        "context": task["context"],
+                        "reference_answer": task["reference_answer"],
                         "prompt_version": version,
                         "prompt_text": prompt_text,
                         "task_key": task_key,
@@ -882,6 +949,48 @@ def main() -> None:
                     flush_pending()
                     pbar.n = produced
                     pbar.refresh()
+        else:
+            for ex in examples:
+                if produced >= target_rows:
+                    break
+
+                versions = pick_prompt_versions(args.prompt_version, rng=rng)
+                for version in versions:
+                    if produced >= target_rows:
+                        break
+                    task_key = make_task_key(
+                        query=ex["query"],
+                        context=ex["context"],
+                        prompt_version=version,
+                        reference_answer=ex["reference_answer"],
+                    )
+                    if task_key in completed_keys:
+                        skipped_existing += 1
+                        continue
+                    system_prompt = system_prompt_for_version(version, idk_text=args.idk_text)
+                    prompt_text = build_prompt_text(
+                        tokenizer=tokenizer,
+                        query=ex["query"],
+                        context=ex["context"],
+                        system_prompt=system_prompt,
+                        enable_thinking=args.enable_thinking,
+                    )
+
+                    pending.append(
+                        {
+                            "query": ex["query"],
+                            "context": ex["context"],
+                            "reference_answer": ex["reference_answer"],
+                            "prompt_version": version,
+                            "prompt_text": prompt_text,
+                            "task_key": task_key,
+                        }
+                    )
+
+                    if len(pending) >= args.batch_size:
+                        flush_pending()
+                        pbar.n = produced
+                        pbar.refresh()
     finally:
         flush_pending()
         if out_buffer:
@@ -893,6 +1002,8 @@ def main() -> None:
         pbar.close()
 
     stats = {
+        "task_mode": task_mode,
+        "tasks_jsonl": args.tasks_jsonl if task_mode else "",
         "global_max_samples": args.max_samples,
         "local_examples_target": local_max,
         "target_rows": target_rows,
