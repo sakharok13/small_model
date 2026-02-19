@@ -6,7 +6,7 @@ Inference script for Qwen3 native structured reasoning output.
 
 Expected model output format:
   <think> ... </think>   (from Qwen3 thinking mode, when enabled)
-  <|answer_start|> ... <|answer_end|>
+  <answer_start> ... <answer_end>
 
 Supports:
   - Single query/context inference
@@ -36,8 +36,13 @@ ANSWER_SPAN_RE = re.compile(
     r"<\|answer_start\|>\s*(.*?)\s*<\|answer_end\|>",
     re.IGNORECASE | re.DOTALL,
 )
+PLAIN_ANSWER_SPAN_RE = re.compile(
+    r"<answer_start>\s*(.*?)\s*<answer_end>",
+    re.IGNORECASE | re.DOTALL,
+)
 THINK_OPEN_RE = re.compile(r"<\|thinking_start\|>\s*(.*)$", re.IGNORECASE | re.DOTALL)
 ANSWER_OPEN_RE = re.compile(r"<\|answer_start\|>\s*(.*)$", re.IGNORECASE | re.DOTALL)
+PLAIN_ANSWER_OPEN_RE = re.compile(r"<answer_start>\s*(.*)$", re.IGNORECASE | re.DOTALL)
 
 # Backward-compatible fallbacks.
 THINK_TAG_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
@@ -48,20 +53,30 @@ ANSWER_MARKER_RE = re.compile(
 )
 
 
-SYSTEM_PROMPT = """You are a precise and detail-oriented assistant tasked with answering factual questions based solely on the provided context.
+SYSTEM_PROMPT = """You are a precise and detail-oriented assistant tasked with answering factual questions based solely on the provided context. Follow these steps:
 
-1. Identify whether the question is bridge or comparison.
-2. Extract exact entities and attributes from context.
-3. Cross-reference evidence step by step.
-4. Use only explicitly supported context details.
-5. Do not use external knowledge.
+1. **Identify the Task Type**: Determine if the question is a *comparison* (e.g., "Which has more X?") or *bridge* (e.g., "X is part of Y, which is linked to Z?"). For *bridge* tasks, map relationships between entities step-by-step (e.g., show → original series → air date). For *comparison* tasks, focus on quantifiable or definitional attributes.
 
-Output format requirements (MANDATORY):
-<|answer_start|>exact final answer<|answer_end|>
+2. **Extract Key Entities**: Highlight the main subjects (e.g., "Katniss Everdeen," "Het Huis Anubis," "The Chimes") and their attributes (e.g., age, release year, album titles) from the context. Use **exact names** (e.g., "The Chimes" vs. "Chimes") to avoid ambiguity.
 
-Do not output anything after <|answer_end|>.
-Do not use <|thinking_start|> or <|thinking_end|>.
-"""
+3. **Cross-Reference Information**:  
+   - For *bridge* tasks, connect disparate pieces of information (e.g., link a TV show to its source material, a character to their age).  
+   - For *comparison* tasks, directly compare attributes (e.g., album release years, character ages) using explicit data from the context.  
+
+4. **Prioritize Exact Matches**: Use **precisely stated details** from the context (e.g., "September 2006" for "Het Huis Anubis") and avoid assumptions. Verify that all claims are explicitly stated or logically inferred (e.g., Katniss’s age remains 16 in *Catching Fire* as no new age is mentioned).
+
+5. **Conclude with a Clear Answer**: Present the final answer in a **bolded, standalone statement**. For *bridge* tasks, ensure the chain of relationships is complete (e.g., "The Dutch-Belgian series 'Het Huis Anubis' first aired in 2006"). For *comparison* tasks, explicitly state the result (e.g., "The song was from the album *The Chimes*").
+
+**Domain-Specific Knowledge to Include**:  
+- **TV/Film**: Recognize adaptations (e.g., *House of Anubis* is based on *Het Huis Anubis*), note air dates, and distinguish between original works and remakes.  
+- **Music**: Identify albums, cover songs, and their original sources (e.g., The Chimes’ cover of U2’s song is on their album *The Chimes*).  
+- **Literature**: Use character ages from novels (e.g., Katniss Everdeen is 16 in *The Hunger Games*).  
+
+**Example**: If asked, "Which album was Pauline Henry’s cover of U2’s song from?" extract the album name (*The Chimes*) from the context, ensuring no confusion with the original song’s album (*The Joshua Tree*). For a *bridge* task like "The Dutch-Belgian series *House of Anubis* was based on what show, which first aired in what year?" link the series to *Het Huis Anubis* and use its air date (2006).  
+
+**Final Answer**: Always provide the answer after your reasoning using this exact format:
+<answer_start>your exact final answer</answer_end>
+Put nothing after `</answer_end>`, ensure alignment with the context and task type, and avoid external knowledge or assumptions."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -348,6 +363,11 @@ def parse_structured_output(raw_text: str) -> Dict[str, Any]:
     if answer_match:
         answer = answer_match.group(1).strip()
         parse_method = "native_answer_tokens"
+    else:
+        plain_answer_match = PLAIN_ANSWER_SPAN_RE.search(raw)
+        if plain_answer_match:
+            answer = plain_answer_match.group(1).strip()
+            parse_method = "plain_answer_tokens"
 
     # Prefer Qwen3 built-in thinking trace first.
     think_tag = THINK_TAG_RE.search(raw)
@@ -371,7 +391,11 @@ def parse_structured_output(raw_text: str) -> Dict[str, Any]:
         think_open = THINK_OPEN_RE.search(raw)
         if think_open:
             tail = think_open.group(1)
-            end_pos = tail.find("<|answer_start|>")
+            end_pos = -1
+            for marker in ("<|answer_start|>", "<answer_start>"):
+                pos = tail.find(marker)
+                if pos >= 0 and (end_pos < 0 or pos < end_pos):
+                    end_pos = pos
             thinking = tail[:end_pos].strip() if end_pos >= 0 else tail.strip()
             if parse_method == "none":
                 parse_method = "native_thinking_start_only"
@@ -386,6 +410,15 @@ def parse_structured_output(raw_text: str) -> Dict[str, Any]:
                 parse_method = "native_answer_start_only"
             else:
                 parse_method = f"{parse_method}+native_answer_start_only"
+
+    if not answer:
+        plain_answer_open = PLAIN_ANSWER_OPEN_RE.search(raw)
+        if plain_answer_open:
+            answer = plain_answer_open.group(1).strip()
+            if parse_method == "none":
+                parse_method = "plain_answer_start_only"
+            else:
+                parse_method = f"{parse_method}+plain_answer_start_only"
 
     if not answer:
         tag = ANSWER_TAG_RE.search(raw)
