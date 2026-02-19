@@ -5,7 +5,7 @@
 Inference script for Qwen3 native structured reasoning output.
 
 Expected model output format:
-  <|thinking_start|> ... <|thinking_end|>
+  <think> ... </think>   (from Qwen3 thinking mode, when enabled)
   <|answer_start|> ... <|answer_end|>
 
 Supports:
@@ -57,10 +57,10 @@ SYSTEM_PROMPT = """You are a precise and detail-oriented assistant tasked with a
 5. Do not use external knowledge.
 
 Output format requirements (MANDATORY):
-<|thinking_start|>concise reasoning based only on context<|thinking_end|>
 <|answer_start|>exact final answer<|answer_end|>
 
 Do not output anything after <|answer_end|>.
+Do not use <|thinking_start|> or <|thinking_end|>.
 """
 
 
@@ -344,13 +344,28 @@ def parse_structured_output(raw_text: str) -> Dict[str, Any]:
     answer = ""
     parse_method = "none"
 
-    think_match = THINK_SPAN_RE.search(raw)
     answer_match = ANSWER_SPAN_RE.search(raw)
-    if think_match:
-        thinking = think_match.group(1).strip()
     if answer_match:
         answer = answer_match.group(1).strip()
-        parse_method = "native_thinking_answer_tokens" if think_match else "native_answer_tokens"
+        parse_method = "native_answer_tokens"
+
+    # Prefer Qwen3 built-in thinking trace first.
+    think_tag = THINK_TAG_RE.search(raw)
+    if think_tag:
+        thinking = think_tag.group(1).strip()
+        if parse_method == "none":
+            parse_method = "think_tag"
+        else:
+            parse_method = f"{parse_method}+think_tag"
+
+    # Backward-compatible fallback: explicit native thinking tokens.
+    think_match = THINK_SPAN_RE.search(raw)
+    if not thinking and think_match:
+        thinking = think_match.group(1).strip()
+        if parse_method == "none":
+            parse_method = "native_thinking_tokens"
+        else:
+            parse_method = f"{parse_method}+native_thinking_tokens"
 
     if not thinking:
         think_open = THINK_OPEN_RE.search(raw)
@@ -360,6 +375,8 @@ def parse_structured_output(raw_text: str) -> Dict[str, Any]:
             thinking = tail[:end_pos].strip() if end_pos >= 0 else tail.strip()
             if parse_method == "none":
                 parse_method = "native_thinking_start_only"
+            else:
+                parse_method = f"{parse_method}+native_thinking_start_only"
 
     if not answer:
         answer_open = ANSWER_OPEN_RE.search(raw)
@@ -367,13 +384,8 @@ def parse_structured_output(raw_text: str) -> Dict[str, Any]:
             answer = answer_open.group(1).strip()
             if parse_method == "none":
                 parse_method = "native_answer_start_only"
-
-    if not thinking:
-        tag = THINK_TAG_RE.search(raw)
-        if tag:
-            thinking = tag.group(1).strip()
-            if parse_method == "none":
-                parse_method = "think_tag"
+            else:
+                parse_method = f"{parse_method}+native_answer_start_only"
 
     if not answer:
         tag = ANSWER_TAG_RE.search(raw)

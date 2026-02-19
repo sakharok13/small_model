@@ -5,12 +5,21 @@ import argparse
 import inspect
 import json
 import os
+import re
 from glob import glob
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+
+THINK_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
+THINK_OPEN_RE = re.compile(r"<think>\s*(.*)$", re.IGNORECASE | re.DOTALL)
+THINK_STOP_RE = re.compile(
+    r"(</think>|<\|answer_start\|>|<answer_start>|\[answer_start\])",
+    re.IGNORECASE,
+)
+SPECIAL_TOKEN_RE = re.compile(r"<\|[^>]+?\|>")
 
 
 def parse_args(default_model_name: str) -> argparse.Namespace:
@@ -20,8 +29,8 @@ def parse_args(default_model_name: str) -> argparse.Namespace:
     ap.add_argument("--trust_remote_code", action="store_true")
     ap.add_argument("--local_files_only", action="store_true")
 
-    ap.add_argument("--train_files", action="append", default=[], help="Parquet file/dir/glob. Repeatable.")
-    ap.add_argument("--eval_files", action="append", default=[], help="Optional parquet file/dir/glob for eval.")
+    ap.add_argument("--train_files", action="append", default=[], help="Parquet/JSONL file/dir/glob. Repeatable.")
+    ap.add_argument("--eval_files", action="append", default=[], help="Optional parquet/JSONL file/dir/glob for eval.")
     ap.add_argument(
         "--prompt_versions",
         type=str,
@@ -32,6 +41,18 @@ def parse_args(default_model_name: str) -> argparse.Namespace:
     ap.add_argument("--max_train_samples", type=int, default=0)
     ap.add_argument("--max_eval_samples", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--thinking_source",
+        type=str,
+        choices=["raw_output_think", "column"],
+        default="raw_output_think",
+        help="Use <think>...</think> from raw_output (recommended) or existing thinking column.",
+    )
+    ap.add_argument(
+        "--fallback_to_thinking_column",
+        action="store_true",
+        help="When --thinking_source=raw_output_think and <think> is missing, fallback to thinking column.",
+    )
 
     ap.add_argument(
         "--filter_correct_only",
@@ -96,25 +117,37 @@ def expand_paths(patterns: Sequence[str]) -> List[str]:
             continue
         if os.path.isdir(pat):
             out.extend(glob(os.path.join(pat, "*.parquet")))
+            out.extend(glob(os.path.join(pat, "*.jsonl")))
+            out.extend(glob(os.path.join(pat, "*.json")))
             continue
         matches = glob(pat)
         if matches:
             for m in matches:
                 if os.path.isdir(m):
                     out.extend(glob(os.path.join(m, "*.parquet")))
+                    out.extend(glob(os.path.join(m, "*.jsonl")))
+                    out.extend(glob(os.path.join(m, "*.json")))
                 elif m.endswith(".parquet"):
                     out.append(m)
+                elif m.endswith(".jsonl") or m.endswith(".json"):
+                    out.append(m)
             continue
-        if os.path.isfile(pat) and pat.endswith(".parquet"):
+        if os.path.isfile(pat) and (pat.endswith(".parquet") or pat.endswith(".jsonl") or pat.endswith(".json")):
             out.append(pat)
     return sorted(set(out))
 
 
-def load_parquet(paths: Sequence[str], name: str) -> Dataset:
+def load_dataset_files(paths: Sequence[str], name: str) -> Dataset:
     if not paths:
-        raise ValueError(f"No parquet files provided for {name}")
-    ds = load_dataset("parquet", data_files=list(paths), split="train")
-    required = {"query", "context", "thinking", "answer", "reference_answer"}
+        raise ValueError(f"No files provided for {name}")
+    exts = {os.path.splitext(p)[1].lower() for p in paths}
+    if exts <= {".parquet"}:
+        ds = load_dataset("parquet", data_files=list(paths), split="train")
+    elif exts <= {".json", ".jsonl"}:
+        ds = load_dataset("json", data_files=list(paths), split="train")
+    else:
+        raise ValueError(f"{name} has mixed/unsupported file extensions: {sorted(exts)}")
+    required = {"query", "context", "answer"}
     missing = sorted(required - set(ds.column_names))
     if missing:
         raise ValueError(f"{name} is missing columns: {missing}")
@@ -123,6 +156,77 @@ def load_parquet(paths: Sequence[str], name: str) -> Dataset:
 
 def str_clean(x: Any) -> str:
     return str(x if x is not None else "").strip()
+
+
+def clean_trace_text(text: str) -> str:
+    text = str(text or "")
+    text = SPECIAL_TOKEN_RE.sub(" ", text)
+    text = text.replace("<s>", " ").replace("</s>", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_think_from_raw_output(raw_output: Any) -> str:
+    raw = str(raw_output or "")
+    m = THINK_RE.search(raw)
+    if m:
+        return clean_trace_text(m.group(1))
+    m_open = THINK_OPEN_RE.search(raw)
+    if not m_open:
+        return ""
+    tail = m_open.group(1)
+    stop = THINK_STOP_RE.search(tail)
+    if stop:
+        tail = tail[:stop.start()]
+    return clean_trace_text(tail)
+
+
+def prepare_reasoning_fields(
+    ds: Dataset,
+    args: argparse.Namespace,
+    split_name: str,
+) -> Tuple[Dataset, Dict[str, Any]]:
+    has_raw_output = "raw_output" in ds.column_names
+    has_thinking_col = "thinking" in ds.column_names
+    if args.thinking_source == "raw_output_think" and (not has_raw_output):
+        raise ValueError(
+            f"{split_name} is missing 'raw_output' but --thinking_source=raw_output_think was requested."
+        )
+    if args.fallback_to_thinking_column and (not has_thinking_col):
+        raise ValueError(
+            f"{split_name} is missing 'thinking' but --fallback_to_thinking_column was requested."
+        )
+
+    def _map(ex: Dict[str, Any]) -> Dict[str, Any]:
+        answer = str_clean(ex.get("answer"))
+        raw_think = extract_think_from_raw_output(ex.get("raw_output"))
+        thinking_col = clean_trace_text(str_clean(ex.get("thinking")))
+        thinking = ""
+        if args.thinking_source == "raw_output_think":
+            thinking = raw_think
+            if (not thinking) and args.fallback_to_thinking_column:
+                thinking = thinking_col
+        else:
+            thinking = thinking_col
+        return {
+            "thinking": thinking,
+            "answer": answer,
+            "_has_raw_think": int(bool(raw_think)),
+            "_has_final_thinking": int(bool(thinking)),
+        }
+
+    ds = ds.map(_map, desc=f"Prepare reasoning fields ({split_name})")
+    has_raw_think_count = int(sum(ds["_has_raw_think"])) if len(ds) > 0 else 0
+    has_final_think_count = int(sum(ds["_has_final_thinking"])) if len(ds) > 0 else 0
+    stats = {
+        "split_name": split_name,
+        "thinking_source": args.thinking_source,
+        "fallback_to_thinking_column": bool(args.fallback_to_thinking_column),
+        "rows": len(ds),
+        "rows_with_raw_think": has_raw_think_count,
+        "rows_with_final_thinking": has_final_think_count,
+    }
+    ds = ds.remove_columns([c for c in ["_has_raw_think", "_has_final_thinking"] if c in ds.column_names])
+    return ds, stats
 
 
 def filter_quality(ds: Dataset, require_thinking: bool, filter_correct_only: bool) -> Tuple[Dataset, Dict[str, int]]:
@@ -143,6 +247,8 @@ def filter_quality(ds: Dataset, require_thinking: bool, filter_correct_only: boo
     after_non_empty = len(ds)
 
     if filter_correct_only:
+        if "reference_answer" not in ds.column_names:
+            raise ValueError("reference_answer column is required when --filter_correct_only is enabled.")
         ds = ds.filter(
             lambda ex: str_clean(ex.get("reference_answer")) == str_clean(ex.get("answer")),
             desc="Filter reference_answer == answer",
@@ -361,10 +467,15 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
         added = register_special_tokens(tokenizer, args)
         print(f"Added special tokens: {added}")
 
-    train_ds = load_parquet(train_paths, name="train")
+    train_ds = load_dataset_files(train_paths, name="train")
     train_ds, train_pv_stats = filter_prompt_versions(
         train_ds,
         allowed=allowed_prompt_versions,
+        split_name="train",
+    )
+    train_ds, train_reasoning_stats = prepare_reasoning_fields(
+        train_ds,
+        args=args,
         split_name="train",
     )
     train_ds, train_stats = filter_quality(
@@ -377,10 +488,15 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
     eval_stats: Dict[str, int] = {}
     eval_paths = expand_paths(args.eval_files)
     if eval_paths:
-        eval_ds = load_parquet(eval_paths, name="eval")
+        eval_ds = load_dataset_files(eval_paths, name="eval")
         eval_ds, eval_pv_stats = filter_prompt_versions(
             eval_ds,
             allowed=allowed_prompt_versions,
+            split_name="eval",
+        )
+        eval_ds, eval_reasoning_stats = prepare_reasoning_fields(
+            eval_ds,
+            args=args,
             split_name="eval",
         )
         eval_ds, eval_stats = filter_quality(
@@ -389,6 +505,7 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
             filter_correct_only=args.filter_correct_only,
         )
         eval_stats["prompt_version_filter"] = eval_pv_stats
+        eval_stats["reasoning_prepare"] = eval_reasoning_stats
     elif args.eval_ratio > 0.0 and len(train_ds) > 1:
         shuffled = train_ds.shuffle(seed=args.seed)
         eval_n = max(1, int(len(shuffled) * args.eval_ratio))
@@ -456,9 +573,13 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
         "eval_rows": len(eval_ds) if eval_ds is not None else 0,
         "prompt_versions_filter": sorted(allowed_prompt_versions),
         "train_prompt_version_filter": train_pv_stats,
+        "train_reasoning_prepare": train_reasoning_stats,
         "train_filter_stats": train_stats,
         "eval_filter_stats": eval_stats,
-        "loss_masking": "labels are computed only for tokens after prefix; supervised segment starts at [thinking_start]",
+        "loss_masking": (
+            "labels are computed only for tokens after prefix; "
+            f"supervised segment starts at {args.thinking_start_token}"
+        ),
         "args": vars(args),
     }
     with open(os.path.join(args.output_dir, "sft_reasoning_summary.json"), "w", encoding="utf-8") as f:
