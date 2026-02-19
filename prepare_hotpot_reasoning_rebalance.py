@@ -27,6 +27,16 @@ from datasets import Dataset, load_dataset
 ALL_VERSIONS: Tuple[str, str, str] = ("v1", "v2", "v3")
 
 
+def normalize_out_dir(path: str) -> str:
+    p = (path or "").strip().rstrip("/")
+    if not p:
+        return p
+    if p.endswith(".parquet"):
+        p = os.path.dirname(p)
+    p = re.sub(r"\.rank\d+$", "", p)
+    return p
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out_dir", type=str, required=True)
@@ -58,6 +68,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--max_samples must be >= 0")
     if not args.plan_dir:
         args.plan_dir = f"{args.out_dir}.rebalance_plan"
+    args.out_dir = normalize_out_dir(args.out_dir)
+    args.plan_dir = args.plan_dir.strip().rstrip("/")
     return args
 
 

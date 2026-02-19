@@ -14,8 +14,8 @@ PY_SCRIPT="${PY_SCRIPT:-${SCRIPT_DIR}/build_hotpot_reasoning_traces_qwen14b.py}"
 PREP_SCRIPT="${PREP_SCRIPT:-${SCRIPT_DIR}/prepare_hotpot_reasoning_rebalance.py}"
 
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-14B}"
-OUT_DIR="${OUT_DIR:-/home/jovyan/gambashidze/small_model/data/hotpot_reasoning_qwen14b}"
-PLAN_DIR="${PLAN_DIR:-${OUT_DIR}.rebalance_plan}"
+RAW_OUT_DIR="${OUT_DIR:-/home/jovyan/gambashidze/small_model/data/hotpot_reasoning_qwen14b}"
+RAW_PLAN_DIR="${PLAN_DIR:-}"
 
 NUM_SHARDS="${NUM_SHARDS:-8}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
@@ -50,6 +50,29 @@ VLLM_DTYPE="${VLLM_DTYPE:-auto}"
 STARTUP_CHECK_SECS="${STARTUP_CHECK_SECS:-20}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
+normalize_out_dir() {
+  local p="${1%/}"
+  if [[ -z "${p}" ]]; then
+    echo "${p}"
+    return 0
+  fi
+  if [[ "${p}" == *.parquet ]]; then
+    p="$(dirname "${p}")"
+    p="${p%/}"
+  fi
+  if [[ "${p}" =~ ^(.+)\.rank[0-9]+$ ]]; then
+    p="${BASH_REMATCH[1]}"
+  fi
+  echo "${p}"
+}
+
+OUT_DIR="$(normalize_out_dir "${RAW_OUT_DIR}")"
+if [[ -z "${RAW_PLAN_DIR}" ]]; then
+  PLAN_DIR="${OUT_DIR}.rebalance_plan"
+else
+  PLAN_DIR="${RAW_PLAN_DIR%/}"
+fi
+
 echo "PY_SCRIPT=${PY_SCRIPT}"
 echo "PREP_SCRIPT=${PREP_SCRIPT}"
 echo "OUT_DIR=${OUT_DIR}"
@@ -58,6 +81,7 @@ echo "MODEL_NAME=${MODEL_NAME}"
 echo "NUM_SHARDS=${NUM_SHARDS}"
 echo "NUM_WORKERS=${NUM_WORKERS}"
 echo "GPU_OFFSET=${GPU_OFFSET}"
+echo "NOTE: OUT_DIR is a prefix; actual outputs are in ${OUT_DIR}.rank*/part-*.parquet"
 
 mkdir -p "${PLAN_DIR}"
 

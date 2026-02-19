@@ -11,6 +11,9 @@ Output parquet fields:
   - answer
   - prompt_version
   - reference_answer
+  - raw_output
+  - parse_ok
+  - parse_method
 """
 
 import argparse
@@ -33,48 +36,49 @@ from synth_utils import ParquetShardWriter, with_rank_suffix_dir
 
 
 SPECIAL_TOKEN_RE = re.compile(r"<\|[^>]+?\|>")
+QWEN3_ANSWER_SPAN_RE = re.compile(r"<\|answer_start\|>\s*(.*?)\s*<\|answer_end\|>", re.IGNORECASE | re.DOTALL)
+QWEN3_ANSWER_OPEN_RE = re.compile(r"<\|answer_start\|>\s*(.*)$", re.IGNORECASE | re.DOTALL)
+PLAIN_ANSWER_SPAN_RE = re.compile(r"<answer_start>\s*(.*?)\s*<answer_end>", re.IGNORECASE | re.DOTALL)
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
 ANSWER_MARKER_RE = re.compile(r"(?:^|\n)\s*(?:final\s+answer|answer)\s*[:\-]\s*(.+)", re.IGNORECASE | re.DOTALL)
 ANSWER_OPEN_TAG_RE = re.compile(r"<answer>\s*(.*)$", re.IGNORECASE | re.DOTALL)
+FINAL_ANSWER_XML_RE = re.compile(r"###\s*<final answer>\s*(.*?)\s*</final answer>", re.IGNORECASE | re.DOTALL)
+FINAL_ANSWER_LINE_RE = re.compile(r"(?:^|\n)\s*final\s+answer\s*[:\-]\s*(.+)", re.IGNORECASE)
+STANDALONE_BOLD_LINE_RE = re.compile(r"(?:^|\n)\s*\*\*(.+?)\*\*\s*(?=\n|$)", re.DOTALL)
+BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 
 IDK_DEFAULT = "I can't find the answer in the context."
 
-PROMPT_V1 = (
-    "You are a QA assistant.\n"
-    "Rules:\n"
-    "1) Use only the provided CONTEXT.\n"
-    "2) Think briefly, then answer.\n"
-    "3) Output exactly:\n"
-    "   <think>brief reasoning</think>\n"
-    "   <answer>final answer</answer>\n"
-    "4) If answer is not in context, output EXACTLY this in <answer>: {idk}\n"
-)
+PROMPT_V4 = """You are a precise and detail-oriented assistant tasked with answering factual questions based solely on the provided context. Follow these steps:
 
-PROMPT_V2_SHORT = (
-    "You are a QA assistant.\n"
-    "Rules:\n"
-    "1) Use only CONTEXT.\n"
-    "2) Keep reasoning extremely short (max 20 words).\n"
-    "3) Output exactly:\n"
-    "   <think>extremely short reasoning</think>\n"
-    "   <answer>final answer</answer>\n"
-    "4) If answer is not in context, output EXACTLY this in <answer>: {idk}\n"
-)
+1. **Identify the Task Type**: Determine if the question is a *comparison* (e.g., "Which has more X?") or *bridge* (e.g., "X is part of Y, which is linked to Z?"). For *bridge* tasks, map relationships between entities step-by-step (e.g., show -> original series -> air date). For *comparison* tasks, focus on quantifiable or definitional attributes.
 
-PROMPT_V3_STRUCTURED = (
-    "You are a QA assistant.\n"
-    "Use only CONTEXT and output exactly:\n"
-    "<think>\n"
-    "facts: key evidence from context\n"
-    "bridge: how evidence connects\n"
-    "check: why this answers the question\n"
-    "</think>\n"
-    "<answer>final answer</answer>\n"
-    "If answer is not in context, output EXACTLY this in <answer>: {idk}\n"
-)
+2. **Extract Key Entities**: Highlight the main subjects (e.g., "Katniss Everdeen," "Het Huis Anubis," "The Chimes") and their attributes (e.g., age, release year, album titles) from the context. Use **exact names** (e.g., "The Chimes" vs. "Chimes") to avoid ambiguity.
 
-ALL_VERSIONS: Tuple[str, str, str] = ("v1", "v2", "v3")
+3. **Cross-Reference Information**:
+   - For *bridge* tasks, connect disparate pieces of information (e.g., link a TV show to its source material, a character to their age).
+   - For *comparison* tasks, directly compare attributes (e.g., album release years, character ages) using explicit data from the context.
+
+4. **Prioritize Exact Matches**: Use **precisely stated details** from the context (e.g., "September 2006" for "Het Huis Anubis") and avoid assumptions. Verify that all claims are explicitly stated or logically inferred (e.g., Katniss's age remains 16 in *Catching Fire* as no new age is mentioned).
+
+5. **Conclude with a Clear Answer**: For *bridge* tasks, ensure the chain of relationships is complete (e.g., "The Dutch-Belgian series 'Het Huis Anubis' first aired in 2006"). For *comparison* tasks, explicitly state the result (e.g., "The song was from the album *The Chimes*").
+
+**Domain-Specific Knowledge to Include**:
+- **TV/Film**: Recognize adaptations (e.g., *House of Anubis* is based on *Het Huis Anubis*), note air dates, and distinguish between original works and remakes.
+- **Music**: Identify albums, cover songs, and their original sources (e.g., The Chimes' cover of U2's song is on their album *The Chimes*).
+- **Literature**: Use character ages from novels (e.g., Katniss Everdeen is 16 in *The Hunger Games*).
+
+**Example**: If asked, "Which album was Pauline Henry's cover of U2's song from?" extract the album name (*The Chimes*) from the context, ensuring no confusion with the original song's album (*The Joshua Tree*). For a *bridge* task like "The Dutch-Belgian series *House of Anubis* was based on what show, which first aired in what year?" link the series to *Het Huis Anubis* and use its air date (2006).
+
+**Final Answer Format (MANDATORY)**:
+- Output your final answer using Qwen3 native boundary tokens exactly once:
+<|answer_start|>your exact final answer<|answer_end|>
+- Put nothing after `<|answer_end|>`.
+- Keep the answer span concise, with no extra explanation inside the span.
+- Do not use external knowledge or assumptions."""
+
+ALL_VERSIONS: Tuple[str] = ("v4",)
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,18 +126,30 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--prompt_version",
         type=str,
-        choices=["v1", "v2", "v3", "mix", "all"],
-        default="mix",
-        help="v1/v2/v3=single version, mix=random single version per example, all=generate all three versions per example",
+        choices=["v4"],
+        default="v4",
+        help="Only v4 is supported for Hotpot reasoning trace generation.",
     )
     ap.add_argument("--idk_text", type=str, default=IDK_DEFAULT)
     ap.add_argument("--max_thinking_words", type=int, default=80)
-    ap.add_argument("--max_thinking_words_v2", type=int, default=20)
     ap.add_argument("--allow_empty_thinking", action="store_true")
     ap.add_argument(
         "--fallback_to_reference_answer",
         action="store_true",
-        help="If parsing fails to extract <answer>, use reference_answer instead of dropping the row.",
+        default=True,
+        help="If parsing fails to extract an answer, use reference_answer instead of dropping the row.",
+    )
+    ap.add_argument(
+        "--no_fallback_to_reference_answer",
+        dest="fallback_to_reference_answer",
+        action="store_false",
+        help="Disable fallback to reference_answer on parse failures.",
+    )
+    ap.add_argument(
+        "--parse_failures_jsonl",
+        type=str,
+        default="",
+        help="Optional path for JSONL parse-failure logs (defaults to <out_dir>/parse_failures.jsonl).",
     )
 
     ap.add_argument("--enable_thinking", action="store_true", default=True)
@@ -221,7 +237,7 @@ def make_task_key(query: Any, context: Any, prompt_version: Any, reference_answe
 def scan_existing_outputs(out_dir: str) -> Tuple[int, Set[str], Dict[str, int]]:
     files = sorted(glob(os.path.join(out_dir, "part-*.parquet")))
     if not files:
-        return 0, set(), {"v1": 0, "v2": 0, "v3": 0}
+        return 0, set(), {"v4": 0}
     try:
         import pyarrow.parquet as pq
     except Exception as exc:  # pragma: no cover
@@ -229,7 +245,7 @@ def scan_existing_outputs(out_dir: str) -> Tuple[int, Set[str], Dict[str, int]]:
 
     total_rows_on_disk = 0
     keys: Set[str] = set()
-    counts_by_version: Dict[str, int] = {"v1": 0, "v2": 0, "v3": 0}
+    counts_by_version: Dict[str, int] = {"v4": 0}
 
     for path in files:
         pf = pq.ParquetFile(path)
@@ -427,22 +443,15 @@ def load_tasks_from_jsonl(path: str) -> List[Dict[str, str]]:
             query = str(row.get("query") or "").strip()
             context = str(row.get("context") or "").strip()
             reference_answer = str(row.get("reference_answer") or "").strip()
-            prompt_version = str(row.get("prompt_version") or "").strip()
+            prompt_version = "v4"
             if not query or not context:
                 continue
-            if prompt_version not in ALL_VERSIONS:
-                raise ValueError(
-                    f"Invalid prompt_version='{prompt_version}' at {path}:{line_no}; "
-                    f"expected one of {list(ALL_VERSIONS)}"
-                )
-            task_key = str(row.get("task_key") or "").strip()
-            if not task_key:
-                task_key = make_task_key(
-                    query=query,
-                    context=context,
-                    prompt_version=prompt_version,
-                    reference_answer=reference_answer,
-                )
+            task_key = make_task_key(
+                query=query,
+                context=context,
+                prompt_version=prompt_version,
+                reference_answer=reference_answer,
+            )
 
             tasks.append(
                 {
@@ -471,21 +480,16 @@ def build_model_kwargs(args: argparse.Namespace, dtype: Any) -> Dict[str, Any]:
 
 
 def system_prompt_for_version(version: str, idk_text: str) -> str:
-    if version == "v1":
-        return PROMPT_V1.format(idk=idk_text)
-    if version == "v2":
-        return PROMPT_V2_SHORT.format(idk=idk_text)
-    if version == "v3":
-        return PROMPT_V3_STRUCTURED.format(idk=idk_text)
+    _ = idk_text
+    if version == "v4":
+        return PROMPT_V4
     raise ValueError(f"Unknown prompt version: {version}")
 
 
 def pick_prompt_versions(configured: str, rng: random.Random) -> List[str]:
-    if configured == "all":
-        return list(ALL_VERSIONS)
-    if configured == "mix":
-        return [rng.choice(list(ALL_VERSIONS))]
-    return [configured]
+    _ = configured
+    _ = rng
+    return ["v4"]
 
 
 def build_prompt_text(
@@ -592,6 +596,7 @@ def clean_content(text: str) -> str:
     text = strip_meta_tokens(text)
     text = re.sub(r"</?(think|answer)>", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"^\s*(answer|final answer)\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = text.replace("**", " ")
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -610,9 +615,17 @@ def linewise_tail(text: str) -> str:
 
 
 def normalize_answer_text(answer: str) -> str:
+    if not answer:
+        return ""
+    bold_spans = list(BOLD_RE.finditer(answer))
+    if bold_spans:
+        answer = bold_spans[-1].group(1)
     answer = clean_content(answer)
     if not answer:
         return ""
+    answer = re.sub(r"^#+\s*", "", answer)
+    answer = re.sub(r"^\s*(?:answer|final answer)\s*[:\-]\s*", "", answer, flags=re.IGNORECASE)
+    answer = answer.replace("**", " ").strip()
     # Keep only the final line when model spills multi-line thoughts into answer.
     answer = linewise_tail(answer) or answer
     answer = answer.strip(" \t\n\r\"'`")
@@ -621,25 +634,76 @@ def normalize_answer_text(answer: str) -> str:
     return answer
 
 
-def parse_reasoning_output(raw_text: str, max_thinking_words: int) -> Tuple[str, str]:
-    text = SPECIAL_TOKEN_RE.sub(" ", raw_text).replace("<s>", " ").replace("</s>", " ").strip()
+def parse_reasoning_output(raw_text: str, max_thinking_words: int) -> Tuple[str, str, bool, str]:
+    raw = str(raw_text).replace("<s>", " ").replace("</s>", " ").strip()
+    text = SPECIAL_TOKEN_RE.sub(" ", raw).strip()
     think_match = THINK_RE.search(text)
     answer_match = ANSWER_RE.search(text)
 
     thinking = think_match.group(1).strip() if think_match else ""
     answer = answer_match.group(1).strip() if answer_match else ""
+    parse_method = "answer_tag" if answer_match else ""
+    answer_start: Optional[int] = answer_match.start() if answer_match else None
+
+    qwen_match = QWEN3_ANSWER_SPAN_RE.search(raw)
+    if qwen_match:
+        answer = qwen_match.group(1).strip()
+        parse_method = "qwen3_answer_tokens"
+        answer_start = None
+        if not thinking:
+            thinking = clean_content(raw[: qwen_match.start()].strip())
+
+    if not answer:
+        plain_span = PLAIN_ANSWER_SPAN_RE.search(raw)
+        if plain_span:
+            answer = plain_span.group(1).strip()
+            parse_method = "plain_answer_tokens"
+            answer_start = None
+            if not thinking:
+                thinking = clean_content(raw[: plain_span.start()].strip())
+
+    if not answer:
+        qwen_open = QWEN3_ANSWER_OPEN_RE.search(raw)
+        if qwen_open:
+            answer = qwen_open.group(1).strip()
+            parse_method = "qwen3_answer_start_only"
+            answer_start = None
+            if not thinking:
+                thinking = clean_content(raw[: qwen_open.start()].strip())
 
     if not answer and think_match:
         tail = text[think_match.end() :].strip()
         open_tag = ANSWER_OPEN_TAG_RE.search(tail)
         if open_tag:
             answer = open_tag.group(1).strip()
+            parse_method = "answer_open_tag_tail"
+            answer_start = think_match.end() + open_tag.start()
         else:
             marker = ANSWER_MARKER_RE.search(tail)
             if marker:
                 answer = marker.group(1).strip()
+                parse_method = "answer_marker_tail"
+                answer_start = think_match.end() + marker.start()
             else:
                 answer = linewise_tail(tail)
+                if answer:
+                    parse_method = "tail_last_line"
+                    answer_start = think_match.end()
+
+    if not answer:
+        xml_match = FINAL_ANSWER_XML_RE.search(text)
+        if xml_match:
+            answer = xml_match.group(1).strip()
+            parse_method = "final_answer_xml"
+            answer_start = xml_match.start()
+
+    if not answer:
+        final_line_matches = list(FINAL_ANSWER_LINE_RE.finditer(text))
+        if final_line_matches:
+            last_match = final_line_matches[-1]
+            answer = last_match.group(1).strip()
+            parse_method = "final_answer_line"
+            answer_start = last_match.start()
 
     if not thinking and answer_match:
         prefix = text[: answer_match.start()].strip()
@@ -652,29 +716,62 @@ def parse_reasoning_output(raw_text: str, max_thinking_words: int) -> Tuple[str,
         marker = ANSWER_MARKER_RE.search(text)
         if marker:
             answer = marker.group(1).strip()
+            parse_method = "answer_marker"
+            answer_start = marker.start()
             if not thinking:
                 prefix = text[: marker.start()].strip()
                 thinking = clean_content(prefix)
         else:
+            bold_line_matches = list(STANDALONE_BOLD_LINE_RE.finditer(text))
+            if bold_line_matches:
+                last_bold = bold_line_matches[-1]
+                answer = last_bold.group(1).strip()
+                parse_method = "standalone_bold_line"
+                answer_start = last_bold.start()
+            else:
+                bold_matches = list(BOLD_RE.finditer(text))
+                if bold_matches:
+                    last_bold = bold_matches[-1]
+                    answer = last_bold.group(1).strip()
+                    parse_method = "last_bold_span"
+                    answer_start = last_bold.start()
+
+        if not answer:
             # Last-resort split: use last non-empty line as answer.
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             if lines:
                 answer = lines[-1]
+                parse_method = "last_line_fallback"
                 if not thinking and len(lines) > 1:
                     thinking = " ".join(lines[:-1])
+
+    if not thinking and answer_start is not None and answer_start > 0:
+        thinking = clean_content(text[:answer_start].strip())
 
     thinking = clean_content(thinking)
     answer = normalize_answer_text(answer)
     if thinking and answer and thinking.lower() == answer.lower():
         answer = ""
+        parse_method = ""
     thinking = truncate_words(thinking, max_words=max_thinking_words)
-    return thinking, answer
+    return thinking, answer, bool(answer), parse_method or "unknown"
 
 
 def thinking_cap_for_version(version: str, args: argparse.Namespace) -> int:
-    if version == "v2":
-        return args.max_thinking_words_v2
+    _ = version
     return args.max_thinking_words
+
+
+def contains_answer_substring(raw_text: str, answer: str) -> bool:
+    expected = str(answer or "").strip().lower()
+    if not expected:
+        return False
+    return expected in strip_meta_tokens(str(raw_text or "")).lower()
+
+
+def append_jsonl(path: str, row: Dict[str, Any]) -> None:
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def write_stats(out_dir: str, stats: Dict[str, Any]) -> None:
@@ -741,7 +838,7 @@ def main() -> None:
             return
 
         examples = examples[:local_max]
-        rows_per_example = 3 if args.prompt_version == "all" else 1
+        rows_per_example = 1
         target_rows = local_max * rows_per_example
 
     if target_rows <= 0:
@@ -750,7 +847,7 @@ def main() -> None:
 
     existing_rows_on_disk = 0
     completed_keys: Set[str] = set()
-    existing_version_counts: Dict[str, int] = {"v1": 0, "v2": 0, "v3": 0}
+    existing_version_counts: Dict[str, int] = {"v4": 0}
     if args.skip_existing:
         existing_rows_on_disk, completed_keys, existing_version_counts = scan_existing_outputs(out_dir)
         if is_local_main and existing_rows_on_disk > 0:
@@ -779,6 +876,9 @@ def main() -> None:
             "skipped_parse": 0,
             "skipped_empty_answer": 0,
             "fallback_reference_answer_used": 0,
+            "parse_failures_logged": 0,
+            "parse_failures_jsonl": args.parse_failures_jsonl.strip()
+            or os.path.join(out_dir, "parse_failures.jsonl"),
             "rank": rank,
             "world": world,
             "args": vars(args),
@@ -835,6 +935,8 @@ def main() -> None:
     skipped_empty = 0
     fallback_reference_answer = 0
     skipped_existing = 0
+    parse_failures_logged = 0
+    parse_failures_jsonl = args.parse_failures_jsonl.strip() or os.path.join(out_dir, "parse_failures.jsonl")
     pbar = tqdm(
         total=target_rows,
         desc=f"hotpot reasoning traces (rank {rank})",
@@ -845,7 +947,8 @@ def main() -> None:
     pbar.refresh()
 
     def flush_pending() -> None:
-        nonlocal pending, out_buffer, produced, skipped_parse, skipped_empty, fallback_reference_answer, skipped_existing
+        nonlocal pending, out_buffer, produced, skipped_parse, skipped_empty
+        nonlocal fallback_reference_answer, skipped_existing, parse_failures_logged
         if not pending or produced >= target_rows:
             pending = []
             return
@@ -881,20 +984,61 @@ def main() -> None:
                 skipped_existing += 1
                 continue
             max_words = thinking_cap_for_version(ex["prompt_version"], args)
-            thinking, answer = parse_reasoning_output(raw_text=raw, max_thinking_words=max_words)
+            thinking, answer, parse_ok, parse_method = parse_reasoning_output(
+                raw_text=raw,
+                max_thinking_words=max_words,
+            )
+            parse_ok_effective = parse_ok
             if not answer:
-                if args.fallback_to_reference_answer and ex["reference_answer"]:
+                if contains_answer_substring(raw_text=raw, answer=ex["reference_answer"]):
+                    answer = str(ex["reference_answer"]).strip()
+                    parse_method = "reference_substring_match"
+                    parse_ok_effective = False
+                elif args.fallback_to_reference_answer and ex["reference_answer"]:
                     answer = str(ex["reference_answer"]).strip()
                     fallback_reference_answer += 1
+                    parse_method = "fallback_reference_answer"
+                    parse_ok_effective = False
                 else:
                     skipped_empty += 1
+                    parse_failures_logged += 1
+                    append_jsonl(
+                        parse_failures_jsonl,
+                        {
+                            "reason": "empty_answer",
+                            "query": ex["query"],
+                            "context": ex["context"],
+                            "reference_answer": ex["reference_answer"],
+                            "prompt_version": ex["prompt_version"],
+                            "parse_method": parse_method,
+                            "raw_output": str(raw),
+                            "parsed_thinking": thinking,
+                            "parsed_answer": answer,
+                        },
+                    )
                     continue
+
+            if not thinking and not args.allow_empty_thinking:
+                skipped_parse += 1
+                parse_failures_logged += 1
+                append_jsonl(
+                    parse_failures_jsonl,
+                    {
+                        "reason": "empty_thinking",
+                        "query": ex["query"],
+                        "context": ex["context"],
+                        "reference_answer": ex["reference_answer"],
+                        "prompt_version": ex["prompt_version"],
+                        "parse_method": parse_method,
+                        "raw_output": str(raw),
+                        "parsed_thinking": thinking,
+                        "parsed_answer": answer,
+                    },
+                )
+                continue
+
             if not thinking:
-                # Keep parser strict: do not inject full raw response into "thinking".
-                # We either allow empty thinking or skip this row as malformed.
-                if not args.allow_empty_thinking:
-                    skipped_parse += 1
-                    continue
+                parse_ok_effective = False
 
             row = {
                 "query": ex["query"],
@@ -903,6 +1047,9 @@ def main() -> None:
                 "answer": answer,
                 "prompt_version": ex["prompt_version"],
                 "reference_answer": ex["reference_answer"],
+                "raw_output": str(raw),
+                "parse_ok": bool(parse_ok_effective),
+                "parse_method": parse_method,
             }
             out_buffer.append(row)
             completed_keys.add(ex["task_key"])
@@ -1018,6 +1165,8 @@ def main() -> None:
         "skipped_parse": skipped_parse,
         "skipped_empty_answer": skipped_empty,
         "fallback_reference_answer_used": fallback_reference_answer,
+        "parse_failures_logged": parse_failures_logged,
+        "parse_failures_jsonl": parse_failures_jsonl,
         "rank": rank,
         "world": world,
         "args": vars(args),
