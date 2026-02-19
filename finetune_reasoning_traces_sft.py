@@ -451,7 +451,9 @@ def main(default_model_name: str = "Qwen/Qwen3-0.6B") -> None:
 
     train_paths = expand_paths(args.train_files)
     if not train_paths:
-        raise ValueError("No train parquet files found. Pass --train_files file/dir/glob.")
+        raise ValueError(
+            "No train dataset files found. Pass --train_files parquet/jsonl/json file/dir/glob."
+        )
     allowed_prompt_versions = parse_prompt_versions(args.prompt_versions)
 
     os.makedirs(args.output_dir, exist_ok=True)

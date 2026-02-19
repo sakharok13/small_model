@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Defaults:
 # - MODEL_SCRIPT=finetune_qwen3_600m_reasoning_sft.py
-# - TRAIN_FILES=/home/jovyan/gambashidze/small_model/data/hotpot_reasoning_qwen14b.rank*/part-*.parquet
+# - TRAIN_FILES=/home/jovyan/gambashidze/small_model/outputs/hotpot_native_reasoning_train.rank*.jsonl
 #
 # Usage examples:
 #   bash run_8gpu_reasoning_sft.sh
@@ -14,7 +14,7 @@ set -euo pipefail
 #   MAX_SEQ_LEN=4096 EVAL_RATIO=0.005 bash run_8gpu_reasoning_sft.sh
 
 MODEL_SCRIPT="${MODEL_SCRIPT:-finetune_qwen3_600m_reasoning_sft.py}"
-TRAIN_FILES="${TRAIN_FILES:-/home/jovyan/gambashidze/small_model/data/hotpot_reasoning_qwen14b.rank*/part-*.parquet}"
+TRAIN_FILES="${TRAIN_FILES:-/home/jovyan/gambashidze/small_model/outputs/hotpot_native_reasoning_train.rank*.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/gambashidze/small_model/runs/reasoning_sft_8gpu}"
 
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
@@ -64,4 +64,3 @@ accelerate launch \
   --bf16 \
   --ddp_backend nccl \
   ${TRAIN_EXTRA_ARGS}
-
